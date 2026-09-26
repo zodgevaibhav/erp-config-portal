@@ -1,0 +1,808 @@
+import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import { useClient } from '../common/ClientContext.jsx';
+import {
+  listPipelineRuns,
+  getPipelineRunSteps,
+  getStepExtracts,
+  getRawPayload,
+  replayPipeline,
+} from '../common/api/pipelineRuns.js';
+
+const STATUS_COLORS = {
+  success: 'bg-emerald-100 text-emerald-700',
+  completed: 'bg-emerald-100 text-emerald-700',
+  failed: 'bg-red-100 text-red-700',
+  error: 'bg-red-100 text-red-700',
+  aborted: 'bg-amber-100 text-amber-700',
+  running: 'bg-blue-100 text-blue-700',
+  pending: 'bg-amber-100 text-amber-700',
+  skipped: 'bg-slate-100 text-slate-600',
+};
+
+const STATUS_ICONS = {
+  success: 'check_circle',
+  completed: 'check_circle',
+  failed: 'error',
+  error: 'error',
+  aborted: 'cancel',
+  running: 'play_arrow',
+  pending: 'schedule',
+  skipped: 'skip_next',
+};
+
+function statusBadge(status) {
+  const s = (status ?? '').toLowerCase();
+  const color = STATUS_COLORS[s] ?? 'bg-slate-100 text-slate-600';
+  const icon = STATUS_ICONS[s];
+  const iconOnlyStates = ['success', 'completed', 'failed', 'error', 'aborted'];
+
+  if (iconOnlyStates.includes(s)) {
+    return (
+      <span
+        title={status ?? '—'}
+        className={`inline-flex items-center justify-center rounded-full p-1 text-sm ${color}`}>
+        <span className="material-symbols-outlined text-sm">{icon}</span>
+      </span>
+    );
+  }
+
+  return (
+    <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-semibold capitalize ${color}`}>
+      {icon && <span className="material-symbols-outlined text-xs">{icon}</span>}
+      {status ?? '—'}
+    </span>
+  );
+}
+
+function formatDateTime(dt) {
+  if (!dt) return '—';
+  try {
+    return new Date(dt).toLocaleString();
+  } catch {
+    return dt;
+  }
+}
+
+// ── Step detail drawer ────────────────────────────────────────────────────────
+function StepDetail({ step, onClose }) {
+  const [extracts, setExtracts] = useState([]);
+  const [tab, setTab] = useState('request');
+
+  useEffect(() => {
+    if (!step) return;
+    getStepExtracts(step.run_id, step.step_pk)
+      .then(setExtracts)
+      .catch(() => setExtracts([]));
+  }, [step]);
+
+  if (!step) return null;
+
+  const getHeaderMap = (kind) => {
+    const candidates = [
+      step?.[`${kind}_headers`],
+      step?.[`${kind}Headers`],
+      step?.[kind]?.headers,
+      step?.headers?.[kind],
+      step?.http_headers?.[kind],
+      step?.http_headers?.[kind.toUpperCase()],
+      step?.request?.headers,
+      step?.response?.headers,
+    ];
+
+    for (const candidate of candidates) {
+      if (candidate && typeof candidate === 'object' && Object.keys(candidate).length) {
+        return candidate;
+      }
+    }
+    return {};
+  };
+
+  const generatedUrl = (
+    step.request_url ||
+    step.generated_url ||
+    step.url ||
+    step.request?.url ||
+    step.response?.url ||
+    step.request_received?.url ||
+    step.transformed_request?.url ||
+    step.response_received?.url ||
+    step.request_received?.request_url ||
+    step.transformed_request?.request_url ||
+    step.response_received?.request_url ||
+    '—'
+  );
+
+  const requestHeaders = getHeaderMap('request');
+  const responseHeaders = getHeaderMap('response');
+
+  const tabs = [
+    { key: 'request', label: 'Request' },
+    { key: 'transformed', label: 'Transformed' },
+    { key: 'response', label: 'Response' },
+    { key: 'headers', label: 'Headers' },
+    { key: 'extracts', label: extracts.length ? `Extracts (${extracts.length})` : 'Extracts' },
+  ];
+
+  const renderExtracts = (list) => {
+    if (list.length === 0) {
+      return <p className="text-sm text-slate-400">No extracted variables for this step.</p>;
+    }
+    return (
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="border-b border-outline-variant text-left text-slate-500">
+            <th className="pb-2 pr-4 font-semibold">Variable</th>
+            <th className="pb-2 font-semibold">Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          {list.map((ex) => (
+            <tr key={ex.extract_pk} className="border-b border-outline-variant/50">
+              <td className="py-1.5 pr-4 font-mono font-semibold text-primary">{ex.var_name}</td>
+              <td className="py-1.5 font-mono text-slate-700">{ex.value ?? '—'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    );
+  };
+
+  const copyText = async (text) => {
+    if (!text) return;
+
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (error) {
+      console.warn('Failed to copy text:', error);
+    }
+  };
+
+  const JsonTextBlock = ({ value, emptyText = '—' }) => {
+    const [copied, setCopied] = useState(false);
+    const serialized =
+      value == null
+        ? emptyText
+        : typeof value === 'string'
+          ? value
+          : JSON.stringify(value, null, 2);
+
+    const handleCopy = async () => {
+      await copyText(serialized === emptyText ? '' : serialized);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    };
+
+    return (
+      <div className="relative overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="absolute right-2 top-2 z-10 rounded-md border border-slate-200 bg-white/90 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-600 shadow-sm transition hover:bg-white hover:text-slate-900">
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+        <pre className="max-h-[22rem] overflow-auto whitespace-pre-wrap break-all p-4 pt-10 font-mono text-xs leading-5 text-slate-700">
+          {serialized || emptyText}
+        </pre>
+      </div>
+    );
+  };
+
+  const renderHeaders = (headerMap) => {
+    const entries = Object.entries(headerMap || {});
+    if (!entries.length) {
+      return <p className="text-sm text-slate-400">No headers recorded for this step.</p>;
+    }
+
+    return (
+      <div className="space-y-3">
+        {entries.map(([key, value]) => (
+          <div key={key} className="relative overflow-hidden rounded-xl border border-outline-variant bg-slate-50 p-3 pt-9">
+            <button
+              type="button"
+              onClick={async () => {
+                const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2) || '—';
+                await copyText(text === '—' ? '' : text);
+              }}
+              className="absolute right-2 top-2 rounded-md border border-slate-200 bg-white/90 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-600 shadow-sm transition hover:bg-white hover:text-slate-900">
+              Copy
+            </button>
+            <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">{key}</div>
+            <pre className="whitespace-pre-wrap break-all font-mono text-xs text-slate-700">
+              {typeof value === 'string' ? value : JSON.stringify(value, null, 2) || '—'}
+            </pre>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  const content = {
+    request: step.request_received,
+    transformed: step.transformed_request,
+    response: step.response_received,
+    headers: {
+      request: requestHeaders,
+      response: responseHeaders,
+    },
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+      <div className="flex w-full max-w-2xl flex-col rounded-3xl bg-white shadow-xl">
+        <div className="flex items-start justify-between border-b border-outline-variant px-6 py-4">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Step Detail</p>
+            <h2 className="mt-1 text-base font-semibold text-slate-900">{step.step_name ?? `Step ${step.step_pk}`}</h2>
+            <p className="mt-0.5 text-xs text-slate-500">
+              Seq {step.seq} &nbsp;·&nbsp; Status Code: {step.status_code ?? '—'} &nbsp;·&nbsp;{' '}
+              {statusBadge(step.status)}
+            </p>
+            <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">Generated URL</div>
+              <div className="mt-1 break-all font-mono text-xs text-slate-700">{generatedUrl}</div>
+            </div>
+            {step.step_fail_reason && (
+              <p className="mt-1 rounded-lg bg-red-50 px-3 py-1.5 text-xs text-red-700">{step.step_fail_reason}</p>
+            )}
+          </div>
+          <button
+            onClick={onClose}
+            className="ml-4 rounded-full p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700">
+            <span className="material-symbols-outlined text-sm">close</span>
+          </button>
+        </div>
+
+        <div className="flex gap-1 border-b border-outline-variant px-6 pt-3">
+          {tabs.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              className={`rounded-t-lg px-3 py-2 text-xs font-semibold transition ${
+                tab === t.key
+                  ? 'border-b-2 border-primary text-primary'
+                  : 'text-slate-500 hover:text-slate-700'
+              }`}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        <div className="max-h-96 overflow-y-auto px-6 py-4">
+          {tab === 'extracts' ? (
+            renderExtracts(extracts)
+          ) : tab === 'headers' ? (
+            <div className="space-y-4">
+              <div>
+                <div className="mb-2 text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Request headers</div>
+                {renderHeaders(requestHeaders)}
+              </div>
+              <div>
+                <div className="mb-2 text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Response headers</div>
+                {renderHeaders(responseHeaders)}
+              </div>
+            </div>
+          ) : (
+            <JsonTextBlock value={content[tab]} emptyText="—" />
+          )}
+        </div>
+
+        <div className="flex justify-end border-t border-outline-variant px-6 py-3">
+          <button
+            onClick={onClose}
+            className="rounded-2xl border border-outline-variant px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50">
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Replay pipeline modal ─────────────────────────────────────────────────────
+function ReplayPipelineModal({ run, onClose, onReplayed }) {
+  const [payloadText, setPayloadText] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
+  const [jsonError, setJsonError] = useState(null);
+  const [replaying, setReplaying] = useState(false);
+  const [replayError, setReplayError] = useState(null);
+  const [replayResult, setReplayResult] = useState(null);
+
+  useEffect(() => {
+    setLoading(true);
+    setLoadError(null);
+    getRawPayload(run.run_id)
+      .then((raw) => setPayloadText(JSON.stringify(raw?.payload ?? {}, null, 2)))
+      .catch((err) => setLoadError(err.message))
+      .finally(() => setLoading(false));
+  }, [run.run_id]);
+
+  const handleSubmit = async () => {
+    let parsedSource;
+    try {
+      parsedSource = JSON.parse(payloadText);
+      setJsonError(null);
+    } catch (err) {
+      setJsonError(`Payload is not valid JSON: ${err.message}`);
+      return;
+    }
+    setReplaying(true);
+    setReplayError(null);
+    setReplayResult(null);
+    try {
+      const result = await replayPipeline(run.run_id, parsedSource);
+      setReplayResult(result);
+      onReplayed();
+    } catch (err) {
+      setReplayError(err.message);
+    } finally {
+      setReplaying(false);
+    }
+  };
+
+  const replaySucceeded = replayResult && (replayResult.status ?? '').toLowerCase() === 'completed';
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+      <div className="flex w-full max-w-2xl flex-col rounded-3xl bg-white shadow-xl">
+        <div className="flex items-start justify-between border-b border-outline-variant px-6 py-4">
+          <div className="min-w-0">
+            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Replay Pipeline</p>
+            <h2 className="mt-1 truncate text-base font-semibold text-slate-900">
+              Run #{run.run_id} · {run.pipeline_id}
+            </h2>
+            <p className="mt-1 text-xs text-slate-500">
+              Edit the original inbound payload below if it needs correcting, then replay. The
+              step that failed (and everything downstream of it) will re-execute using this
+              payload.
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="ml-4 shrink-0 rounded-full p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700">
+            <span className="material-symbols-outlined text-sm">close</span>
+          </button>
+        </div>
+
+        <div className="px-6 py-4">
+          {loading && <p className="text-sm text-slate-400">Loading original payload…</p>}
+          {loadError && <p className="text-sm text-red-600">{loadError}</p>}
+          {!loading && !loadError && (
+            <textarea
+              value={payloadText}
+              onChange={(e) => setPayloadText(e.target.value)}
+              rows={16}
+              spellCheck={false}
+              className="w-full rounded-xl border border-outline-variant bg-slate-50 p-4 font-mono text-xs text-slate-700 outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
+            />
+          )}
+          {jsonError && <p className="mt-2 text-xs text-red-600">{jsonError}</p>}
+          {replayError && <p className="mt-2 text-xs text-red-600">{replayError}</p>}
+          {replayResult && (
+            <p className={`mt-2 text-xs ${replaySucceeded ? 'text-emerald-600' : 'text-red-600'}`}>
+              Replay finished with status: <strong>{replayResult.status}</strong>
+              {replayResult.message ? ` — ${replayResult.message}` : ''}
+              {replayResult.error ? ` — ${replayResult.error}` : ''}
+            </p>
+          )}
+        </div>
+
+        <div className="flex justify-end gap-2 border-t border-outline-variant px-6 py-3">
+          <button
+            onClick={onClose}
+            className="rounded-2xl border border-outline-variant px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50">
+            Close
+          </button>
+          <button
+            onClick={handleSubmit}
+            disabled={loading || !!loadError || replaying}
+            className="rounded-2xl bg-red-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-red-700 disabled:opacity-50">
+            {replaying ? 'Replaying…' : 'Replay Pipeline'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Date filter helpers ─────────────────────────────────────────────────────
+function startOfDay(d) {
+  const r = new Date(d);
+  r.setHours(0, 0, 0, 0);
+  return r;
+}
+function startOfWeek(d) {
+  const r = startOfDay(d);
+  r.setDate(r.getDate() - r.getDay());
+  return r;
+}
+function startOfMonth(d) {
+  const r = startOfDay(d);
+  r.setDate(1);
+  return r;
+}
+
+const DATE_PRESETS = [
+  { key: '', label: 'All Time' },
+  { key: 'today', label: 'Today' },
+  { key: 'week', label: 'This Week' },
+  { key: 'month', label: 'This Month' },
+  { key: 'custom', label: 'Custom' },
+];
+
+function getPresetRange(key) {
+  const now = new Date();
+  if (key === 'today') return { from: startOfDay(now), to: null };
+  if (key === 'week') return { from: startOfWeek(now), to: null };
+  if (key === 'month') return { from: startOfMonth(now), to: null };
+  return null;
+}
+
+// ── Main screen ───────────────────────────────────────────────────────────────
+function PipelineExecutions() {
+  const { activeClientId } = useClient();
+  const [runs, setRuns] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [datePreset, setDatePreset] = useState('');
+  const [customFrom, setCustomFrom] = useState('');
+  const [customTo, setCustomTo] = useState('');
+
+  // Selected run & its steps
+  const [selectedRun, setSelectedRun] = useState(null);
+  const [steps, setSteps] = useState([]);
+  const [stepsLoading, setStepsLoading] = useState(false);
+  const [stepsError, setStepsError] = useState(null);
+
+  // Step detail drawer
+  const [selectedStep, setSelectedStep] = useState(null);
+
+  // Replay pipeline modal
+  const [showReplayModal, setShowReplayModal] = useState(false);
+
+  const loadRuns = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    setRuns([]);
+    setSelectedRun(null);
+    setSteps([]);
+    listPipelineRuns(activeClientId)
+      .then(setRuns)
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false));
+  }, [activeClientId]);
+
+  useEffect(() => {
+    loadRuns();
+  }, [loadRuns]);
+
+  const filteredRuns = useMemo(() => {
+    let list = runs;
+    if (search) {
+      const q = search.toLowerCase();
+      list = list.filter(
+        (r) =>
+          String(r.run_id).includes(q) ||
+          (r.pipeline_id ?? '').toLowerCase().includes(q) ||
+          String(r.raw_payload_id ?? '').includes(q),
+      );
+    }
+    if (statusFilter) {
+      list = list.filter((r) => (r.status ?? '').toLowerCase() === statusFilter.toLowerCase());
+    }
+    if (datePreset && datePreset !== 'custom') {
+      const range = getPresetRange(datePreset);
+      if (range) {
+        list = list.filter((r) => {
+          if (!r.created_at) return false;
+          const t = new Date(r.created_at);
+          return t >= range.from;
+        });
+      }
+    }
+    if (datePreset === 'custom') {
+      if (customFrom) {
+        const from = new Date(customFrom);
+        list = list.filter((r) => r.created_at && new Date(r.created_at) >= from);
+      }
+      if (customTo) {
+        const to = new Date(customTo);
+        to.setHours(23, 59, 59, 999);
+        list = list.filter((r) => r.created_at && new Date(r.created_at) <= to);
+      }
+    }
+    return list;
+  }, [runs, search, statusFilter, datePreset, customFrom, customTo]);
+
+  const loadStepsForRun = (runId) => {
+    setSteps([]);
+    setStepsError(null);
+    setStepsLoading(true);
+    getPipelineRunSteps(runId)
+      .then(setSteps)
+      .catch((err) => setStepsError(err.message))
+      .finally(() => setStepsLoading(false));
+  };
+
+  const selectRun = (run) => {
+    setSelectedRun(run);
+    loadStepsForRun(run.run_id);
+  };
+
+  // After a replay attempt, the run's status/steps may have changed --
+  // refresh both the list (for its status badge) and the currently open
+  // run's step detail, without losing the modal so the user can see the
+  // result message.
+  const handleReplayed = () => {
+    if (!selectedRun) return;
+    loadStepsForRun(selectedRun.run_id);
+    listPipelineRuns(activeClientId)
+      .then((updatedRuns) => {
+        setRuns(updatedRuns);
+        const updatedSelected = updatedRuns.find((r) => r.run_id === selectedRun.run_id);
+        if (updatedSelected) setSelectedRun(updatedSelected);
+      })
+      .catch(() => {});
+  };
+
+  const isFailed = (run) => {
+    const s = (run?.status ?? '').toLowerCase();
+    return s === 'failed' || s === 'error';
+  };
+
+  const distinctStatuses = useMemo(
+    () => [...new Set(runs.map((r) => r.status).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+    [runs],
+  );
+
+  return (
+    <div className="grid w-full gap-4 xl:grid-cols-[0.45fr_0.55fr]">
+      {/* ── Left: Run list ── */}
+      <div className="min-w-0 overflow-hidden rounded-[28px] border border-outline-variant bg-white shadow-sm">
+        <div className="flex items-center justify-between border-b border-outline-variant bg-surface-container-low px-5 py-4">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Executions</p>
+            <h2 className="mt-2 text-lg font-semibold text-slate-900">Pipeline Runs</h2>
+          </div>
+          <button
+            onClick={loadRuns}
+            disabled={loading}
+            title="Refresh"
+            className="rounded-full p-2 text-slate-500 transition hover:bg-slate-100 disabled:opacity-50">
+            <span className="material-symbols-outlined text-sm">refresh</span>
+          </button>
+        </div>
+
+        {/* Filters */}
+        <div className="flex flex-col gap-2 border-b border-outline-variant px-5 py-3">
+          <div className="flex gap-2">
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search run ID / pipeline…"
+              className="flex-1 rounded-2xl border border-outline-variant bg-white px-3 py-1.5 text-xs text-slate-700 outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
+            />
+            <select
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              className="rounded-2xl border border-outline-variant bg-white px-2 py-1.5 text-xs text-slate-700 outline-none focus:border-primary">
+              <option value="">All Status</option>
+              {distinctStatuses.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Date preset pills */}
+          <div className="flex flex-wrap gap-1.5">
+            {DATE_PRESETS.map((p) => (
+              <button
+                key={p.key}
+                onClick={() => { setDatePreset(p.key); setCustomFrom(''); setCustomTo(''); }}
+                className={`rounded-full px-3 py-1 text-xs font-semibold transition ${
+                  datePreset === p.key
+                    ? 'bg-primary text-white'
+                    : 'border border-outline-variant bg-white text-slate-600 hover:bg-slate-50'
+                }`}>
+                {p.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Custom date inputs */}
+          {datePreset === 'custom' && (
+            <div className="flex items-center gap-2">
+              <input
+                type="date"
+                value={customFrom}
+                onChange={(e) => setCustomFrom(e.target.value)}
+                className="rounded-2xl border border-outline-variant bg-white px-3 py-1.5 text-xs text-slate-700 outline-none focus:border-primary"
+              />
+              <span className="text-xs text-slate-400">to</span>
+              <input
+                type="date"
+                value={customTo}
+                onChange={(e) => setCustomTo(e.target.value)}
+                className="rounded-2xl border border-outline-variant bg-white px-3 py-1.5 text-xs text-slate-700 outline-none focus:border-primary"
+              />
+            </div>
+          )}
+        </div>
+
+        <div className="max-h-[calc(100vh-300px)] overflow-y-auto">
+          {loading && (
+            <p className="px-5 py-6 text-sm text-slate-400">Loading pipeline runs…</p>
+          )}
+          {error && (
+            <p className="px-5 py-4 text-sm text-red-600">{error}</p>
+          )}
+          {!loading && !error && filteredRuns.length === 0 && (
+            <p className="px-5 py-6 text-sm text-slate-400">No pipeline runs found.</p>
+          )}
+          {filteredRuns.map((run) => (
+            <button
+              key={run.run_id}
+              onClick={() => selectRun(run)}
+              className={`flex w-full items-center gap-3 border-b border-outline-variant/50 px-5 py-3 text-left transition hover:bg-surface-container-low ${
+                selectedRun?.run_id === run.run_id ? 'bg-primary/5' : ''
+              }`}>
+              <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate text-xs font-semibold text-slate-900">
+                    {run.pipeline_id}
+                  </span>
+                  {statusBadge(run.status)}
+                </div>
+                <div className="flex items-center gap-2 text-xs text-slate-500">
+                  <span>Run #{run.run_id}</span>
+                  {run.raw_payload_id && <span>· Payload: {run.raw_payload_id}</span>}
+                </div>
+                <div className="text-xs text-slate-400">{formatDateTime(run.created_at)}</div>
+              </div>
+              <span className="material-symbols-outlined text-sm text-slate-300">chevron_right</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Right: Run detail + steps ── */}
+      <div className="min-w-0 overflow-hidden rounded-[28px] border border-outline-variant bg-white shadow-sm">
+        {!selectedRun ? (
+          <div className="flex h-full flex-col items-center justify-center gap-3 py-20 text-center text-slate-400">
+            <span className="material-symbols-outlined text-4xl">playlist_play</span>
+            <p className="text-sm">Select a pipeline run to see its steps</p>
+          </div>
+        ) : (
+          <>
+            {/* Run header */}
+            <div className="border-b border-outline-variant bg-surface-container-low px-5 py-4">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                    Run #{selectedRun.run_id}
+                  </p>
+                  <h2 className="mt-1 truncate text-base font-semibold text-slate-900">
+                    {selectedRun.pipeline_id}
+                  </h2>
+                  <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                    {statusBadge(selectedRun.status)}
+                    <span>Started: {formatDateTime(selectedRun.created_at)}</span>
+                    {selectedRun.completed_at && (
+                      <span>Completed: {formatDateTime(selectedRun.completed_at)}</span>
+                    )}
+                  </div>
+                  {selectedRun.pipeline_fail_reason && (
+                    <div className="mt-2 wrap-break-word rounded-xl bg-red-50 px-3 py-2 text-xs text-red-700">
+                      <span className="font-semibold">Failure reason: </span>
+                      {selectedRun.pipeline_fail_reason}
+                    </div>
+                  )}
+                </div>
+
+                {/* Replay button */}
+                {isFailed(selectedRun) && (
+                  <button
+                    onClick={() => setShowReplayModal(true)}
+                    className="flex shrink-0 items-center gap-1.5 rounded-2xl bg-red-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-red-700">
+                    <span className="material-symbols-outlined text-sm">replay</span>
+                    {' '}Replay Pipeline
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Steps list */}
+            <div className="px-5 py-4">
+              <p className="mb-3 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Steps</p>
+
+              {stepsLoading && (
+                <p className="text-sm text-slate-400">Loading steps…</p>
+              )}
+              {stepsError && (
+                <p className="text-sm text-red-600">{stepsError}</p>
+              )}
+              {!stepsLoading && !stepsError && steps.length === 0 && (
+                <p className="text-sm text-slate-400">No steps recorded for this run.</p>
+              )}
+
+              <div className="max-h-[calc(100vh-380px)] overflow-auto pb-2">
+                <div className="flex min-w-max flex-wrap gap-3">
+                  {steps.map((step, idx) => {
+                    const failed = ['failed', 'error'].includes((step.status ?? '').toLowerCase());
+                    const stepKey = step.run_step_pk ?? step.step_pk ?? `${step.seq ?? idx + 1}-${idx}`;
+
+                    return (
+                      <React.Fragment key={stepKey}>
+                        <button
+                          onClick={() => setSelectedStep(step)}
+                          className={`group w-55 rounded-2xl border px-3 py-2.5 text-left text-[11px] leading-relaxed transition hover:shadow-sm ${
+                            failed
+                              ? 'border-red-200 bg-red-50 hover:bg-red-100'
+                              : 'border-outline-variant bg-surface-container-low hover:bg-slate-100'
+                          }`}>
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="flex min-w-0 items-center gap-2">
+                              <span
+                                className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[10px] font-bold ${
+                                  failed ? 'bg-red-200 text-red-700' : 'bg-primary/10 text-primary'
+                                }`}>
+                                {step.seq ?? idx + 1}
+                              </span>
+                              <span className="min-w-0 wrap-break-word font-semibold text-slate-900">
+                                {step.step_name ?? `Step ${step.step_pk}`}
+                              </span>
+                            </div>
+                            {statusBadge(step.status)}
+                          </div>
+
+                          <div className="mt-2 space-y-1 wrap-break-word text-slate-500">
+                            <div>HTTP {step.status_code ?? '—'}</div>
+                            <div>{formatDateTime(step.created_at)}</div>
+                            {step.step_fail_reason && (
+                              <p className="wrap-break-word text-red-600">{step.step_fail_reason}</p>
+                            )}
+                          </div>
+
+                          <div className="mt-2 flex items-center justify-between border-t border-slate-200 pt-2 text-[10px] text-slate-400">
+                            <span>Open details</span>
+                            <span className="material-symbols-outlined text-sm">open_in_new</span>
+                          </div>
+                        </button>
+
+                        {idx < steps.length - 1 && (
+                          <span className="mt-8 shrink-0 self-start text-slate-300 material-symbols-outlined text-base">
+                            arrow_forward
+                          </span>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Step detail drawer */}
+      {selectedStep && (
+        <StepDetail step={selectedStep} onClose={() => setSelectedStep(null)} />
+      )}
+
+      {/* Replay pipeline modal */}
+      {showReplayModal && selectedRun && (
+        <ReplayPipelineModal
+          run={selectedRun}
+          onClose={() => setShowReplayModal(false)}
+          onReplayed={handleReplayed}
+        />
+      )}
+    </div>
+  );
+}
+
+export default PipelineExecutions;
