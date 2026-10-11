@@ -111,6 +111,12 @@ const INITIAL_SOURCE = JSON.stringify(
   { legacy_id: 10293, firstName: "John", lastName: "Doe", email_addr: "john.d@oldmail.com", status: 1, attributes: { tier: "premium", joined: "2022-05-12" } },
   null, 2,
 );
+const ITERATION_SAMPLE_ITEMS = [
+  { id: "CT-1001", name: "Northwind renewal", startDate: "2026-01-15" },
+  { id: "CT-1002", name: "Contoso support", startDate: "2026-03-01" },
+  { id: "CT-1003", name: "Fabrikam license", startDate: "2026-06-20" },
+];
+const ITERATION_SAMPLE_ROOT = { batchId: "BATCH-2026-041" };
 
 // ── component ─────────────────────────────────────────────────────────────────
 function CreateUpdateWorkflow({ stepPk, onBack }) {
@@ -123,6 +129,13 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
   const [stepName, setStepName] = useState("");
   const [method, setMethod] = useState("POST");
   const [stepPath, setStepPath] = useState("/");
+  const [executionMode, setExecutionMode] = useState("single");
+  const [iterationConfigCollapsed, setIterationConfigCollapsed] = useState(false);
+  const [arrayJsonPath, setArrayJsonPath] = useState("$.contracts[*]");
+  const [itemAlias, setItemAlias] = useState("item");
+  const [rootAlias, setRootAlias] = useState("root");
+  const [iterationPreviewMode, setIterationPreviewMode] = useState("single");
+  const [selectedIterationItem, setSelectedIterationItem] = useState(0);
 
   // Target system
   const [targets, setTargets] = useState([]);
@@ -179,6 +192,11 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
         setStepName(stepData.step_name);
         setMethod(stepData.method);
         setStepPath(stepData.path ?? "/");
+        const iterationConfig = stepData.iteration_config ?? { mode: "single" };
+        setExecutionMode(iterationConfig.mode === "for_each_array_item" ? "forEach" : "single");
+        setArrayJsonPath(iterationConfig.array_json_path || "$.contracts[*]");
+        setItemAlias(iterationConfig.item_alias || "item");
+        setRootAlias(iterationConfig.root_alias || "root");
         setSelectedTargetId(stepData.target_id ?? "");
         setQueryParams(toKVArray(stepData.query_params));
         setRequestHeaders(toKVArray(stepData.headers));
@@ -334,6 +352,42 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
 
   const previewJson = useMemo(() => JSON.stringify(previewObject, null, 2), [previewObject]);
 
+  const iterationPreviewObjects = useMemo(() => {
+    const resolveIterationSource = (sourcePath, item) => {
+      if (!sourcePath) return undefined;
+      const itemPrefix = `${itemAlias}.`;
+      const rootPrefix = `${rootAlias}.`;
+      if (sourcePath.startsWith(itemPrefix)) return getNestedValue(item, sourcePath.slice(itemPrefix.length));
+      if (sourcePath.startsWith(rootPrefix)) return getNestedValue(ITERATION_SAMPLE_ROOT, sourcePath.slice(rootPrefix.length));
+      return getNestedValue(item, sourcePath);
+    };
+
+    return ITERATION_SAMPLE_ITEMS.map((item) => {
+      if (!rules.length) {
+        return {
+          contractId: item.id,
+          contractName: item.name,
+          startDate: item.startDate,
+          batchId: ITERATION_SAMPLE_ROOT.batchId,
+        };
+      }
+      return rules.reduce((acc, rule, index) => {
+        const path = rule.target || `field_${index + 1}`;
+        const raw = rule.kind === "CONST" ? rule.source || "" : resolveIterationSource(rule.source, item);
+        let value = raw;
+        if (rule.kind !== "CONST") {
+          value = raw === undefined ? null : applyPreviewTransform(raw, rule.kind, rule.params);
+        }
+        setNestedValue(acc, path, value);
+        return acc;
+      }, {});
+    });
+  }, [itemAlias, rootAlias, rules]);
+  const selectedIterationPreviewJson = useMemo(
+    () => JSON.stringify(iterationPreviewObjects[selectedIterationItem] || {}, null, 2),
+    [iterationPreviewObjects, selectedIterationItem],
+  );
+
   // Rules whose source_path doesn't resolve against the current Source JSON -- these
   // preview as null even though the real payload may well have a value at save/run time.
   const unresolvedRules = useMemo(
@@ -402,6 +456,16 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
         query_params: Object.keys(qpObj).length ? qpObj : null,
         headers: Object.keys(hdrsObj).length ? hdrsObj : null,
         extract: Object.keys(extObj).length ? extObj : null,
+        ...(stepType === STEP_TYPE.TRANSFORM_POST && {
+          iteration_config: executionMode === "forEach"
+            ? {
+                mode: "for_each_array_item",
+                array_json_path: arrayJsonPath.trim(),
+                item_alias: itemAlias.trim(),
+                root_alias: rootAlias.trim(),
+              }
+            : { mode: "single" },
+        }),
       };
 
       const savedStep = stepPk
@@ -519,7 +583,7 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
   // ── shared header bar ─────────────────────────────────────────────────────
   const headerBar = (
     <div className="flex items-center gap-4 rounded-[28px] border border-outline-variant bg-white px-5 py-4 shadow-sm">
-      <div className="flex-1 min-w-0">
+      <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">{typeBadge}</div>
         <input
           value={stepName}
@@ -527,6 +591,23 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
           className="mt-1 w-full border-0 bg-transparent text-lg font-semibold text-slate-900 outline-none placeholder:text-slate-300"
           placeholder="Enter step name…"
         />
+        {stepType === STEP_TYPE.TRANSFORM_POST && (
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">Execution Mode</span>
+            <fieldset aria-label="Execution Mode" className="inline-flex rounded-2xl border border-outline-variant bg-slate-50 p-0.5">
+              {[
+                { value: "single", label: "Single Execution" },
+                { value: "forEach", label: "For Each Array Item" },
+              ].map((option) => (
+                <button key={option.value} type="button" aria-pressed={executionMode === option.value}
+                  onClick={() => setExecutionMode(option.value)}
+                  className={`rounded-2xl px-3 py-1.5 text-xs font-semibold transition ${executionMode === option.value ? "bg-primary text-white shadow-sm" : "text-slate-500 hover:bg-white hover:text-slate-700"}`}>
+                  {option.label}
+                </button>
+              ))}
+            </fieldset>
+          </div>
+        )}
       </div>
       <div className="flex shrink-0 items-center gap-2">
         {saveError && <span className="max-w-xs truncate text-xs text-red-600">{saveError}</span>}
@@ -580,6 +661,11 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
           </div>
         )}
       </div>
+      {executionMode === "forEach" && !isGetStore && (
+        <p className="shrink-0 border-b border-outline-variant bg-indigo-50 px-5 py-2 text-[11px] font-medium text-indigo-700">
+          Target operation is configured to run for each array item.
+        </p>
+      )}
       {!targetConfigCollapsed && (
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
 
@@ -824,10 +910,73 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
             </div>
           </div>
 
-          {/* Transformation Rules */}
-          <div className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden rounded-[28px] border border-outline-variant bg-white shadow-sm">
+          {/* Array iteration configuration and Transformation Rules */}
+          <div className="flex h-full min-h-0 w-full min-w-0 flex-col gap-4">
+            {executionMode === "forEach" && (
+              <section className="shrink-0 overflow-hidden rounded-[28px] border border-outline-variant bg-white shadow-sm" aria-labelledby="iteration-config-heading">
+                <div className="flex items-center justify-between gap-3 border-b border-outline-variant bg-surface-container-low px-4 py-3">
+                  <div>
+                    <h2 id="iteration-config-heading" className="text-sm font-semibold text-slate-700">Array Iteration Configuration</h2>
+                    {!iterationConfigCollapsed && (
+                      <p className="mt-0.5 text-[11px] text-slate-500">Configure one step request for each selected source-array item.</p>
+                    )}
+                  </div>
+                  <button type="button" aria-expanded={!iterationConfigCollapsed}
+                    onClick={() => setIterationConfigCollapsed((collapsed) => !collapsed)}
+                    className="flex shrink-0 items-center gap-1 rounded-xl border border-outline-variant bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-100">
+                    <span className="material-symbols-outlined text-base">{iterationConfigCollapsed ? "chevron_right" : "expand_less"}</span>
+                    {iterationConfigCollapsed ? "Expand" : "Collapse"}
+                  </button>
+                </div>
+                {!iterationConfigCollapsed && (
+                  <div className="space-y-3 p-4">
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="space-y-1.5 sm:col-span-2">
+                        <label htmlFor="array-jsonpath" className="block text-xs font-semibold text-slate-600">Array JSONPath</label>
+                        <input id="array-jsonpath" value={arrayJsonPath} onChange={(e) => setArrayJsonPath(e.target.value)}
+                          placeholder="$.contracts[*]"
+                          className="w-full rounded-2xl border border-outline-variant bg-white px-3 py-2 text-xs text-slate-900 outline-none focus:border-primary focus:ring-2 focus:ring-primary/10" />
+                        <p className="text-[10px] leading-4 text-slate-500">Select the array whose elements should be processed individually.</p>
+                      </div>
+                      <div className="space-y-1.5">
+                        <label htmlFor="item-alias" className="block text-xs font-semibold text-slate-600">Item Alias</label>
+                        <input id="item-alias" value={itemAlias} onChange={(e) => setItemAlias(e.target.value)}
+                          className="w-full rounded-2xl border border-outline-variant bg-white px-3 py-2 text-xs text-slate-900 outline-none focus:border-primary focus:ring-2 focus:ring-primary/10" />
+                        <p className="text-[10px] leading-4 text-slate-500">Reference fields from the current array element.</p>
+                      </div>
+                      <div className="space-y-1.5">
+                        <label htmlFor="root-alias" className="block text-xs font-semibold text-slate-600">Root Alias</label>
+                        <input id="root-alias" value={rootAlias} onChange={(e) => setRootAlias(e.target.value)}
+                          className="w-full rounded-2xl border border-outline-variant bg-white px-3 py-2 text-xs text-slate-900 outline-none focus:border-primary focus:ring-2 focus:ring-primary/10" />
+                        <p className="text-[10px] leading-4 text-slate-500">Reference fields from the original source JSON.</p>
+                      </div>
+                    </div>
+                    <div className="rounded-2xl border border-indigo-100 bg-indigo-50/70 p-3">
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <p className="text-xs font-semibold text-slate-700">Iteration Summary</p>
+                        <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${arrayJsonPath.trim() ? "bg-green-100 text-green-700" : "bg-amber-100 text-amber-700"}`}>
+                          {arrayJsonPath.trim() ? "Configured · sample preview" : "Array path required"}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2 text-[10px]">
+                        <div><p className="text-slate-500">Selected array path</p><p className="mt-0.5 truncate font-mono font-semibold text-slate-700">{arrayJsonPath || "Not selected"}</p></div>
+                        <div><p className="text-slate-500">Sample items</p><p className="mt-0.5 font-semibold text-slate-700">{ITERATION_SAMPLE_ITEMS.length} <span className="font-normal text-slate-500">illustrative</span></p></div>
+                        <div><p className="text-slate-500">Sample target requests</p><p className="mt-0.5 font-semibold text-slate-700">{ITERATION_SAMPLE_ITEMS.length} <span className="font-normal text-slate-500">illustrative</span></p></div>
+                      </div>
+                      <p className="mt-2 text-[10px] text-slate-500">Illustrative values only; no array detection or requests are performed.</p>
+                    </div>
+                  </div>
+                )}
+              </section>
+            )}
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-[28px] border border-outline-variant bg-white shadow-sm">
             <div className="flex shrink-0 items-center justify-between border-b border-outline-variant bg-surface-container-low px-5 py-4">
-              <span className="text-sm font-semibold text-slate-600">Transformation Rules</span>
+              <div className="min-w-0">
+                <span className="text-sm font-semibold text-slate-600">Transformation Rules</span>
+                {executionMode === "forEach" && (
+                  <p className="mt-1 text-[10px] text-slate-500">Rules are applied to each array element. Example references: <code className="font-mono text-indigo-700">{itemAlias || "item"}.id</code>, <code className="font-mono text-indigo-700">{itemAlias || "item"}.name</code>, <code className="font-mono text-indigo-700">{itemAlias || "item"}.startDate</code>, <code className="font-mono text-indigo-700">{rootAlias || "root"}.batchId</code>.</p>
+                )}
+              </div>
               <div className="flex items-center gap-2">
                 <div className="flex rounded-2xl border border-outline-variant bg-white p-0.5 text-xs font-semibold">
                   <button type="button" onClick={openBuilderModeIfNeeded}
@@ -844,6 +993,9 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
                     className="rounded-2xl bg-primary px-3 py-1.5 text-xs font-semibold text-white transition hover:brightness-95">
                     Add Rule
                   </button>
+                )}
+                {executionMode === "forEach" && (
+                  <span className="shrink-0 rounded-full bg-indigo-100 px-2 py-1 text-[10px] font-bold text-indigo-700">Per Item</span>
                 )}
               </div>
             </div>
@@ -943,6 +1095,7 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
             </div>
             )}
           </div>
+          </div>
         </div>
 
         {/* Right: Target Config + Output Preview */}
@@ -950,14 +1103,60 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
           {targetConfigPanel}
           {/* Output Preview */}
           <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-[28px] border border-outline-variant bg-white shadow-sm">
-            <div className="flex shrink-0 items-center gap-2 border-b border-outline-variant bg-surface-container-low px-5 py-4">
-              <span className="text-sm font-semibold text-slate-600">Output Preview</span>
-              <UnresolvedWarningBadge rules={unresolvedRules} />
+            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-outline-variant bg-surface-container-low px-5 py-4">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-semibold text-slate-600">Output Preview</span>
+                <UnresolvedWarningBadge rules={unresolvedRules} />
+              </div>
+              {executionMode === "forEach" && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <fieldset aria-label="Output preview mode" className="inline-flex rounded-xl border border-outline-variant bg-white p-0.5">
+                    {[
+                      { value: "single", label: "Single Item" },
+                      { value: "all", label: "All Items" },
+                    ].map((option) => (
+                      <button key={option.value} type="button" aria-pressed={iterationPreviewMode === option.value}
+                        onClick={() => setIterationPreviewMode(option.value)}
+                        className={`rounded-lg px-2 py-1 text-[10px] font-semibold ${iterationPreviewMode === option.value ? "bg-primary text-white" : "text-slate-500 hover:bg-slate-100"}`}>
+                        {option.label}
+                      </button>
+                    ))}
+                  </fieldset>
+                  {iterationPreviewMode === "single" && (
+                    <label className="sr-only" htmlFor="sample-item-select">Select sample item</label>
+                  )}
+                  {iterationPreviewMode === "single" && (
+                    <select id="sample-item-select" value={selectedIterationItem}
+                      onChange={(e) => setSelectedIterationItem(Number(e.target.value))}
+                      className="rounded-xl border border-outline-variant bg-white px-2 py-1.5 text-[10px] font-semibold text-slate-700 outline-none focus:border-primary">
+                      {ITERATION_SAMPLE_ITEMS.map((item, index) => <option key={item.id} value={index}>Item {index + 1}</option>)}
+                    </select>
+                  )}
+                </div>
+              )}
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto bg-slate-950 p-4">
-              <pre className="whitespace-pre-wrap break-all rounded-3xl border border-slate-800 bg-slate-950 p-4 font-code-md text-[12px] text-slate-100">
-                {previewJson}
-              </pre>
+              {executionMode === "forEach" ? (
+                <>
+                  <p className="mb-3 px-1 text-[10px] text-amber-300">Sample preview data only — no target requests have been executed.</p>
+                  {iterationPreviewMode === "single" ? (
+                    <pre className="whitespace-pre-wrap break-all rounded-3xl border border-slate-800 bg-slate-950 p-4 font-code-md text-[12px] text-slate-100">
+                      {selectedIterationPreviewJson}
+                    </pre>
+                  ) : (
+                    iterationPreviewObjects.map((payload, index) => (
+                      <div key={ITERATION_SAMPLE_ITEMS[index].id} className="mb-3 rounded-3xl border border-slate-800 bg-slate-950 p-3">
+                        <p className="mb-2 text-[10px] font-semibold text-slate-400">Sample item {index + 1}</p>
+                        <pre className="whitespace-pre-wrap break-all font-code-md text-[12px] text-slate-100">{JSON.stringify(payload, null, 2)}</pre>
+                      </div>
+                    ))
+                  )}
+                </>
+              ) : (
+                <pre className="whitespace-pre-wrap break-all rounded-3xl border border-slate-800 bg-slate-950 p-4 font-code-md text-[12px] text-slate-100">
+                  {previewJson}
+                </pre>
+              )}
             </div>
           </div>
         </div>
