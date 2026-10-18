@@ -184,10 +184,34 @@ const mappingToRule = (m, id) => {
   };
 };
 
+// Key-by-key get/set on already-split path segments (same semantics as _get_segments/_set_object_path
+// in transformation-svc: objects only, no [index] syntax).
+const getSegments = (node, segments) => {
+  let current = node;
+  for (const seg of segments) {
+    if (current == null || typeof current !== "object" || Array.isArray(current) || !(seg in current)) return undefined;
+    current = current[seg];
+  }
+  return current;
+};
+const setSegments = (root, segments, value) => {
+  let current = root;
+  segments.slice(0, -1).forEach((seg) => {
+    if (current[seg] == null || typeof current[seg] !== "object" || Array.isArray(current[seg])) current[seg] = {};
+    current = current[seg];
+  });
+  current[segments[segments.length - 1]] = value;
+};
+const isBelow = (target, root) => target.length > root.length && root.every((seg, i) => target[i] === seg);
+
 // Editor rules -> output JSON, mirroring transform_payload() in transformation-svc: flat rules first,
 // then one group per (arraySource, arrayTarget). Source paths inside a group are relative to the
-// array item (or the singleton scope). "default_value" and extracted values aren't modelled here.
-const buildTransformPreview = (rules, sourceData) => {
+// array item (or the singleton object). A group whose array target is below a REPEATING group's target
+// is that group's child (to any depth) and is built inside each parent item, reading the remainder of
+// its array source ("contracts" -> "contracts.contractLines") from that item. Any other dotted target is
+// a nested object path. "default_value" and extracted values aren't modelled here. Problems are pushed
+// onto `warnings` (the engine raises instead).
+const buildTransformPreview = (rules, sourceData, warnings = []) => {
   const resolve = (rule, scope) => {
     if (rule.kind === "CONST") return rule.source || "";
     const raw = getNestedValue(scope, rule.source);
@@ -205,51 +229,58 @@ const buildTransformPreview = (rules, sourceData) => {
   const buildFields = (entries, scope) =>
     entries.reduce((acc, { rule, target }) => { setNestedValue(acc, target, resolve(rule, scope)); return acc; }, {});
 
-  // A dotted array target is a child array when a repeating group's target is its prefix
-  // ("Line.Attrs" under "Line"); otherwise it's a nested object path ("lines.LineItems" ->
-  // { lines: { LineItems: [...] } }). Shallower targets are classified first. Mirrors transform_payload().
-  const targetOf = (entries) => entries[0].rule.arrayTarget.trim();
-  const segmentsOf = (entries) => splitPath(targetOf(entries));
-  const isBelow = (target, root) => target.length > root.length && root.every((seg, i) => target[i] === seg);
-  const rootGroups = [];
-  const repeatingRoots = [];
-  [...grouped.values()]
-    .map((entries, order) => ({ entries, order }))
-    .sort((x, y) => segmentsOf(x.entries).length - segmentsOf(y.entries).length)
-    .forEach(({ entries, order }) => {
-      const target = segmentsOf(entries);
-      if (repeatingRoots.some((root) => isBelow(target, root))) return;
-      rootGroups.push({ entries, order });
-      if (entries[0].rule.arrayKind === "repeating") repeatingRoots.push(target);
-    });
-  rootGroups.sort((x, y) => x.order - y.order);
+  const groups = [...grouped.values()].map((entries) => {
+    const { arraySource, arrayTarget, arrayKind } = entries[0].rule;
+    return {
+      entries,
+      kind: arrayKind,
+      arraySource: arraySource || "",
+      sourceSegs: splitPath(arraySource || ""),
+      targetSegs: splitPath(arrayTarget.trim()),
+      children: [],
+    };
+  });
+  const repeating = groups.filter((g) => g.kind === "repeating");
+  const roots = [];
+  groups.forEach((group) => {
+    const ancestors = repeating.filter((r) => isBelow(group.targetSegs, r.targetSegs));
+    if (!ancestors.length) { roots.push(group); return; }
+    ancestors.reduce((best, r) => (r.targetSegs.length > best.targetSegs.length ? r : best)).children.push(group);
+  });
 
-  for (const { entries } of rootGroups) {
-    const { arraySource, arrayKind } = entries[0].rule;
-    const targetSegments = segmentsOf(entries);
-    let value;
-    if (arrayKind !== "repeating") {
-      const built = buildFields(entries, getNestedValue(sourceData, arraySource));
-      value = arrayKind === "singleton_object" ? built : [built];
-    } else {
-      const items = getNestedValue(sourceData, arraySource);
-      value = Array.isArray(items)
-        ? items.map((item) => {
-            const builtItem = buildFields(entries, item);
-            for (const nestedEntries of grouped.values()) {
-              const nestedSegments = segmentsOf(nestedEntries);
-              if (!isBelow(nestedSegments, targetSegments)) continue;
-              const childKey = (nestedEntries[0].rule.arraySource || "").split("[].").slice(1).join("[].");
-              const childScope = item && typeof item === "object" ? getNestedValue(item, childKey) : undefined;
-              builtItem[nestedSegments[nestedSegments.length - 1]] = [buildFields(nestedEntries, childScope)];
-            }
-            return builtItem;
-          })
-        : [];
+  const wrap = (group, built) => (group.kind === "singleton_object" ? built : [built]);
+  const buildItem = (group, scope) => {
+    const built = buildFields(group.entries, scope);
+    group.children.forEach((child) => attachChild(group, child, scope, built));
+    return built;
+  };
+  const attachChild = (parent, child, parentScope, builtParent) => {
+    // Legacy child "lines[].attrs": ONE source object under each parent item, as a one-element array.
+    if (child.arraySource.includes("[].")) {
+      const childKey = child.arraySource.split("[].").slice(1).join("[].");
+      const scope = parentScope && typeof parentScope === "object" ? getNestedValue(parentScope, childKey) : undefined;
+      builtParent[child.targetSegs[child.targetSegs.length - 1]] = [buildFields(child.entries, scope)];
+      return;
     }
-    if (targetSegments.length > 1) setNestedValue(result, targetOf(entries), value);
-    else result[targetSegments[0]] = value;
-  }
+    if (!isBelow(child.sourceSegs, parent.sourceSegs)) {
+      const msg = `Array source "${child.arraySource}" must start with its parent array's "${parent.arraySource}" (target "${parent.targetSegs.join(".")}" → "${child.targetSegs.join(".")}").`;
+      if (!warnings.includes(msg)) warnings.push(msg);
+      return;
+    }
+    const node = getSegments(parentScope, child.sourceSegs.slice(parent.sourceSegs.length));
+    const value = child.kind === "repeating"
+      ? (Array.isArray(node) ? node.map((element) => buildItem(child, element)) : [])
+      : wrap(child, buildItem(child, node));
+    setSegments(builtParent, child.targetSegs.slice(parent.targetSegs.length), value);
+  };
+
+  roots.forEach((group) => {
+    const node = getSegments(sourceData, group.sourceSegs);
+    const value = group.kind === "repeating"
+      ? (Array.isArray(node) ? node.map((element) => buildItem(group, element)) : [])
+      : wrap(group, buildItem(group, node));
+    setSegments(result, group.targetSegs, value);
+  });
   return result;
 };
 const INITIAL_SOURCE = JSON.stringify(
@@ -431,7 +462,10 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
     catch { setJsonError("Invalid JSON — preview uses last valid object."); }
   };
 
-  const previewObject = useMemo(() => buildTransformPreview(rules, sourceData), [rules, sourceData]);
+  const { previewObject, previewWarnings } = useMemo(() => {
+    const warnings = [];
+    return { previewObject: buildTransformPreview(rules, sourceData, warnings), previewWarnings: warnings };
+  }, [rules, sourceData]);
 
   const previewJson = useMemo(() => JSON.stringify(previewObject, null, 2), [previewObject]);
 
@@ -933,6 +967,7 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
             </p>
             {!isGetStore && <UnresolvedWarningBadge rules={unresolvedRules} dark />}
           </div>
+          {!isGetStore && <PreviewWarnings warnings={previewWarnings} dark />}
           <pre className="flex-1 overflow-auto bg-slate-950 px-6 py-5 font-mono text-sm leading-relaxed text-slate-100">
             {isGetStore ? storedPreview : previewJson}
           </pre>
@@ -1269,9 +1304,12 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
                   )}
                 </>
               ) : (
-                <pre className="whitespace-pre-wrap break-all rounded-3xl border border-slate-800 bg-slate-950 p-4 font-code-md text-[12px] text-slate-100">
-                  {previewJson}
-                </pre>
+                <>
+                  <PreviewWarnings warnings={previewWarnings} />
+                  <pre className="whitespace-pre-wrap break-all rounded-3xl border border-slate-800 bg-slate-950 p-4 font-code-md text-[12px] text-slate-100">
+                    {previewJson}
+                  </pre>
+                </>
               )}
             </div>
           </div>
@@ -1333,6 +1371,16 @@ function PairSection({ label, pairs, onAdd, onUpdate, onRemove }) {
         </div>
       ))}
       {pairs.length === 0 && <p className="text-xs text-slate-400">None configured.</p>}
+    </div>
+  );
+}
+
+// Mapping problems the engine would reject (e.g. a child array whose source doesn't continue its parent's).
+function PreviewWarnings({ warnings, dark }) {
+  if (!warnings.length) return null;
+  return (
+    <div className={`mb-2 space-y-1 rounded-2xl border px-3 py-2 text-xs ${dark ? "border-amber-400/30 bg-amber-400/10 text-amber-300" : "border-amber-200 bg-amber-50 text-amber-700"}`}>
+      {warnings.map((w) => <p key={w}>{w}</p>)}
     </div>
   );
 }
