@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useClient } from '../common/ClientContext.jsx';
 import { listSteps } from '../common/api/steps.js';
-import { getPipeline, getPipelineSteps, updatePipeline } from '../common/api/pipelines.js';
+import { getPipeline, getPipelineSteps, updatePipeline, dryRunPipeline } from '../common/api/pipelines.js';
 import { attachStep, detachStep, updatePipelineStep } from '../common/api/pipelineSteps.js';
 
 function ViewEditPipeline({ pipelineId, onBack }) {
@@ -18,6 +18,13 @@ function ViewEditPipeline({ pipelineId, onBack }) {
   const [savingFields, setSavingFields] = useState(false);
   const [saveFieldsError, setSaveFieldsError] = useState(null);
   const [savedFieldsOk, setSavedFieldsOk] = useState(false);
+
+  // Dry run: apply the pipeline's saved field mappings to a pasted source payload (server-side, nothing is sent or stored)
+  const [showDryRun, setShowDryRun] = useState(false);
+  const [dryRunSource, setDryRunSource] = useState('{\n  \n}');
+  const [dryRunLoading, setDryRunLoading] = useState(false);
+  const [dryRunError, setDryRunError] = useState(null);
+  const [dryRunResult, setDryRunResult] = useState(null);
 
   // Save order
   const [savingOrder, setSavingOrder] = useState(false);
@@ -127,6 +134,28 @@ function ViewEditPipeline({ pipelineId, onBack }) {
     }
   };
 
+  // ── dry run ──────────────────────────────────────────────────────────────
+  const runDryRun = async () => {
+    setDryRunError(null);
+    let source;
+    try {
+      source = JSON.parse(dryRunSource);
+      if (source === null || typeof source !== 'object' || Array.isArray(source)) throw new Error('Source must be a JSON object.');
+    } catch (err) {
+      setDryRunError(`Invalid source JSON: ${err.message}`);
+      return;
+    }
+    setDryRunLoading(true);
+    try {
+      setDryRunResult(await dryRunPipeline(pipeline.pipeline_id, source));
+    } catch (err) {
+      setDryRunResult(null);
+      setDryRunError(err.message);
+    } finally {
+      setDryRunLoading(false);
+    }
+  };
+
   if (loading) {
     return <div className="flex w-full items-center justify-center py-20 text-sm text-slate-500">Loading pipeline…</div>;
   }
@@ -150,11 +179,22 @@ function ViewEditPipeline({ pipelineId, onBack }) {
             <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Pipeline details</p>
             <h2 className="mt-2 text-lg font-semibold text-slate-900">{pipeline.pipeline_id}</h2>
           </div>
-          <button
-            onClick={onBack}
-            className="rounded-2xl border border-outline-variant bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:bg-surface-container-high">
-            Back
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowDryRun((v) => !v)}
+              aria-pressed={showDryRun}
+              className={`flex items-center gap-1 rounded-2xl px-3 py-2 text-sm font-semibold transition ${
+                showDryRun ? 'bg-primary text-white' : 'border border-primary/40 bg-white text-primary hover:bg-primary/5'
+              }`}>
+              <span className="material-symbols-outlined text-sm">science</span>
+              Dry Run
+            </button>
+            <button
+              onClick={onBack}
+              className="rounded-2xl border border-outline-variant bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:bg-surface-container-high">
+              Back
+            </button>
+          </div>
         </div>
         <div className="space-y-6 p-5">
           {/* Editable fields */}
@@ -276,6 +316,7 @@ function ViewEditPipeline({ pipelineId, onBack }) {
         </div>
       </div>
 
+
       {/* Available steps */}
       <div className="rounded-[28px] border border-outline-variant bg-white shadow-sm">
         <div className="border-b border-outline-variant bg-surface-container-low px-5 py-4">
@@ -314,6 +355,54 @@ function ViewEditPipeline({ pipelineId, onBack }) {
           })}
         </div>
       </div>
+      {/* Dry run panel */}
+      {showDryRun && (
+        <div className="rounded-[28px] border border-outline-variant bg-white shadow-sm xl:col-span-2">
+          <div className="border-b border-outline-variant bg-surface-container-low px-5 py-4">
+            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Dry run</p>
+            <p className="mt-1 text-xs text-slate-500">
+              Applies the saved field mappings of every step in this pipeline to the source below. Nothing is sent to a target system
+              or stored. Values a real run would extract from an earlier step's response show as
+              {' '}<code className="rounded bg-slate-100 px-1">&lt;EXTRACTED_VALUE_FROM-&gt;variable&gt;</code>.
+            </p>
+          </div>
+          <div className="grid gap-4 p-5 lg:grid-cols-2">
+            <div className="space-y-2">
+              <label className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">Source JSON</label>
+              <textarea
+                value={dryRunSource}
+                onChange={(e) => setDryRunSource(e.target.value)}
+                spellCheck={false}
+                className="h-72 w-full rounded-2xl border border-outline-variant bg-white p-3 font-mono text-xs text-slate-900 outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
+              />
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={runDryRun}
+                  disabled={dryRunLoading}
+                  className="rounded-2xl bg-primary px-4 py-2 text-sm font-semibold text-white transition hover:brightness-95 disabled:opacity-50">
+                  {dryRunLoading ? 'Running…' : 'Run Dry Run'}
+                </button>
+                {dryRunError && <span className="text-xs text-red-600">{dryRunError}</span>}
+              </div>
+            </div>
+            <div className="space-y-3">
+              <label className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">Transformed output per step</label>
+              {!dryRunResult && <p className="text-sm text-slate-500">Run the dry run to see each step's transformed request body.</p>}
+              {dryRunResult?.steps?.map((st) => (
+                <div key={`${st.seq}-${st.step_name}`} className="rounded-2xl border border-outline-variant bg-slate-50">
+                  <div className="flex items-center gap-2 border-b border-outline-variant px-3 py-2">
+                    <span className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/10 text-[10px] font-bold text-primary">{st.seq}</span>
+                    <span className="text-sm font-semibold text-slate-900">{st.step_name}</span>
+                    <span className="text-xs text-slate-500">{st.method} → {st.target_name}</span>
+                  </div>
+                  <pre className="max-h-64 overflow-auto p-3 font-mono text-xs text-slate-800">{JSON.stringify(st.transformed_body, null, 2)}</pre>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }

@@ -107,6 +107,118 @@ const setNestedValue = (root, path, value) => {
     current = current[pointer];
   });
 };
+// Best-effort JS mirror of apply_field_transform() (transformation-svc/erp_transform/transform.py)
+// for live preview only -- the actual transform always runs server-side.
+const applyPreviewTransform = (raw, kind, paramsStr) => {
+  if (raw === undefined || raw === null) return raw;
+  let params = {};
+  try { params = paramsStr ? JSON.parse(paramsStr) : {}; } catch { /* ignore invalid params in preview */ }
+  switch (kind) {
+    case "uppercase": return String(raw).toUpperCase();
+    case "lowercase": return String(raw).toLowerCase();
+    case "titlecase": return String(raw).replace(/\w\S*/g, (t) => t[0].toUpperCase() + t.slice(1).toLowerCase());
+    case "trim": return String(raw).trim();
+    case "round": return Number(Number(raw).toFixed(params.decimals ?? 0));
+    case "type_cast":
+      if (params.targetType === "int") return parseInt(raw, 10);
+      if (params.targetType === "float") return parseFloat(raw);
+      if (params.targetType === "bool") return ["true", "1", "yes"].includes(String(raw).toLowerCase());
+      return String(raw);
+    case "replace": {
+      const find = params.find ?? "", repl = params.replace ?? "";
+      return params.regex ? String(raw).replace(new RegExp(find, "g"), repl) : String(raw).split(find).join(repl);
+    }
+    case "split_pick": {
+      const parts = String(raw).split(params.delimiter ?? ",");
+      return parts[params.index ?? 0] ?? null;
+    }
+    case "date_format":
+    case "date_add":
+      return raw; // date math intentionally not mirrored in preview -- see server response after save
+    default:
+      return raw;
+  }
+};
+
+
+// Array-mapping kinds <-> the (array_target_path, is_singleton_array, is_object_target) columns.
+// Mirrors the three non-flat row shapes documented in transformation-svc/erp_transform/transform.py.
+const ARRAY_KINDS = [
+  { value: "none", label: "None (plain field)" },
+  { value: "repeating", label: "Repeating array (one element per source item)" },
+  { value: "singleton_array", label: "Single-item array ([ {...} ])" },
+  { value: "singleton_object", label: "Single nested object ({...})" },
+];
+const arrayKindFromMapping = (m) => {
+  if (!m.array_target_path) return "none";
+  if (!m.is_singleton_array) return "repeating";
+  return m.is_object_target ? "singleton_object" : "singleton_array";
+};
+const isArrayRule = (rule) => !!rule.arrayKind && rule.arrayKind !== "none" && !!(rule.arrayTarget || "").trim();
+
+// Field-mapping row (API shape) -> editor rule. mapping_pk is deliberately not carried here;
+// callers that load persisted rows add it.
+const mappingToRule = (m, id) => {
+  const isLiteral = (m.source_path || "").startsWith(LITERAL_PREFIX);
+  return {
+    id,
+    kind: isLiteral ? "CONST" : (m.transform_type || "none"),
+    source: isLiteral ? m.source_path.slice(LITERAL_PREFIX.length) : (m.source_path || ""),
+    target: m.target_path || "",
+    params: m.transform_params || "",
+    arrayKind: arrayKindFromMapping(m),
+    arraySource: m.array_source_path || "",
+    arrayTarget: m.array_target_path || "",
+  };
+};
+
+// Editor rules -> output JSON, mirroring transform_payload() in transformation-svc: flat rules first,
+// then one group per (arraySource, arrayTarget). Source paths inside a group are relative to the
+// array item (or the singleton scope). "default_value" and extracted values aren't modelled here.
+const buildTransformPreview = (rules, sourceData) => {
+  const resolve = (rule, scope) => {
+    if (rule.kind === "CONST") return rule.source || "";
+    const raw = getNestedValue(scope, rule.source);
+    return raw === undefined ? null : applyPreviewTransform(raw, rule.kind, rule.params);
+  };
+  const result = {};
+  const grouped = new Map();
+  rules.forEach((rule, index) => {
+    const target = rule.target || `field_${index + 1}`;
+    if (!isArrayRule(rule)) { setNestedValue(result, target, resolve(rule, sourceData)); return; }
+    const key = `${rule.arraySource || ""}\u0000${rule.arrayTarget.trim()}`;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push({ rule, target });
+  });
+  const buildFields = (entries, scope) =>
+    entries.reduce((acc, { rule, target }) => { acc[target] = resolve(rule, scope); return acc; }, {});
+
+  for (const entries of grouped.values()) {
+    const { arraySource, arrayTarget, arrayKind } = entries[0].rule;
+    const targetKey = arrayTarget.trim();
+    if (targetKey.includes(".")) continue; // nested group: built inside its parent below
+    if (arrayKind !== "repeating") {
+      const built = buildFields(entries, getNestedValue(sourceData, arraySource));
+      result[targetKey] = arrayKind === "singleton_object" ? built : [built];
+      continue;
+    }
+    const items = getNestedValue(sourceData, arraySource);
+    result[targetKey] = Array.isArray(items)
+      ? items.map((item) => {
+          const builtItem = buildFields(entries, item);
+          for (const [nestedKey, nestedEntries] of grouped) {
+            const nestedTarget = nestedKey.split("\u0000")[1];
+            if (!nestedTarget.startsWith(`${targetKey}.`)) continue;
+            const childKey = (nestedEntries[0].rule.arraySource || "").split("[].").slice(1).join("[].");
+            const childScope = item && typeof item === "object" ? getNestedValue(item, childKey) : undefined;
+            builtItem[nestedTarget.split(".").pop()] = [buildFields(nestedEntries, childScope)];
+          }
+          return builtItem;
+        })
+      : [];
+  }
+  return result;
+};
 const INITIAL_SOURCE = JSON.stringify(
   { legacy_id: 10293, firstName: "John", lastName: "Doe", email_addr: "john.d@oldmail.com", status: 1, attributes: { tier: "premium", joined: "2022-05-12" } },
   null, 2,
@@ -204,17 +316,7 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
           Object.entries(stepData.extract ?? {}).map(([target, source]) => ({ source, target })),
         );
         const sorted = [...mappings].sort((a, b) => a.sort_order - b.sort_order);
-        const mappedRules = sorted.map((m) => {
-          const isLiteral = (m.source_path || "").startsWith(LITERAL_PREFIX);
-          return {
-            id: `rule-${m.mapping_pk}`,
-            mapping_pk: m.mapping_pk,
-            kind: isLiteral ? "CONST" : (m.transform_type || "none"),
-            source: isLiteral ? m.source_path.slice(LITERAL_PREFIX.length) : m.source_path,
-            target: m.target_path,
-            params: m.transform_params || "",
-          };
-        });
+        const mappedRules = sorted.map((m) => ({ ...mappingToRule(m, `rule-${m.mapping_pk}`), mapping_pk: m.mapping_pk }));
         setRules(mappedRules);
         setExistingRuleMappingPks(mappedRules.filter((rule) => rule.mapping_pk).map((rule) => rule.mapping_pk));
         setStepType(stepData.method === "GET" ? STEP_TYPE.GET_STORE : STEP_TYPE.TRANSFORM_POST);
@@ -242,34 +344,28 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
     setRules((c) => c.map((r, i) => (i === index ? { ...r, [field]: value } : r)));
   const addRule = () => {
     const id = `rule-new-${Date.now()}`;
-    setRules((c) => [...c, { id, kind: "none", source: "", target: "", params: "" }]);
+    setRules((c) => [...c, { id, kind: "none", source: "", target: "", params: "", arrayKind: "none", arraySource: "", arrayTarget: "" }]);
     setExpandedRuleId(id);
   };
   const removeRule = (index) => setRules((c) => c.filter((_, i) => i !== index));
 
   // ── rules <-> mapping-array JSON (same shape as the field-mappings API) ───
-  const ruleToMappingEntry = (rule, index) => ({
-    source_path: rule.kind === "CONST" ? `${LITERAL_PREFIX}${rule.source || ""}` : (rule.source || ""),
-    target_path: rule.target || "",
-    transform_type: rule.kind === "CONST" ? "none" : rule.kind,
-    transform_params: TYPES_WITH_PARAMS.has(rule.kind) && rule.params ? rule.params : null,
-    sort_order: index,
-    is_required: false,
-    array_source_path: "",
-    array_target_path: "",
-    is_singleton_array: false,
-  });
-  const mappingEntryToRule = (entry, index) => {
-    const sourcePath = entry.source_path || "";
-    const isLiteral = sourcePath.startsWith(LITERAL_PREFIX);
+  const ruleToMappingEntry = (rule, index) => {
+    const inArray = isArrayRule(rule);
     return {
-      id: `rule-json-${index}-${Date.now()}`,
-      kind: isLiteral ? "CONST" : (entry.transform_type || "none"),
-      source: isLiteral ? sourcePath.slice(LITERAL_PREFIX.length) : sourcePath,
-      target: entry.target_path || "",
-      params: entry.transform_params || "",
+      source_path: rule.kind === "CONST" ? `${LITERAL_PREFIX}${rule.source || ""}` : (rule.source || ""),
+      target_path: rule.target || "",
+      transform_type: rule.kind === "CONST" ? "none" : rule.kind,
+      transform_params: TYPES_WITH_PARAMS.has(rule.kind) && rule.params ? rule.params : null,
+      sort_order: index,
+      is_required: false,
+      array_source_path: inArray ? (rule.arraySource || "") : "",
+      array_target_path: inArray ? rule.arrayTarget.trim() : "",
+      is_singleton_array: inArray && rule.arrayKind !== "repeating",
+      is_object_target: inArray && rule.arrayKind === "singleton_object",
     };
   };
+  const mappingEntryToRule = (entry, index) => mappingToRule(entry, `rule-json-${index}-${Date.now()}`);
   // Switching into JSON mode snapshots the current rules; switching back keeps whatever last parsed cleanly.
   const openRulesJsonMode = () => {
     setRulesJsonText(JSON.stringify(rules.map(ruleToMappingEntry), null, 2));
@@ -302,53 +398,7 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
     catch { setJsonError("Invalid JSON — preview uses last valid object."); }
   };
 
-  // Best-effort JS mirror of apply_field_transform() (transformation-svc/erp_transform/transform.py)
-  // for live preview only -- the actual transform always runs server-side.
-  const applyPreviewTransform = (raw, kind, paramsStr) => {
-    if (raw === undefined || raw === null) return raw;
-    let params = {};
-    try { params = paramsStr ? JSON.parse(paramsStr) : {}; } catch { /* ignore invalid params in preview */ }
-    switch (kind) {
-      case "uppercase": return String(raw).toUpperCase();
-      case "lowercase": return String(raw).toLowerCase();
-      case "titlecase": return String(raw).replace(/\w\S*/g, (t) => t[0].toUpperCase() + t.slice(1).toLowerCase());
-      case "trim": return String(raw).trim();
-      case "round": return Number(Number(raw).toFixed(params.decimals ?? 0));
-      case "type_cast":
-        if (params.targetType === "int") return parseInt(raw, 10);
-        if (params.targetType === "float") return parseFloat(raw);
-        if (params.targetType === "bool") return ["true", "1", "yes"].includes(String(raw).toLowerCase());
-        return String(raw);
-      case "replace": {
-        const find = params.find ?? "", repl = params.replace ?? "";
-        return params.regex ? String(raw).replace(new RegExp(find, "g"), repl) : String(raw).split(find).join(repl);
-      }
-      case "split_pick": {
-        const parts = String(raw).split(params.delimiter ?? ",");
-        return parts[params.index ?? 0] ?? null;
-      }
-      case "date_format":
-      case "date_add":
-        return raw; // date math intentionally not mirrored in preview -- see server response after save
-      default:
-        return raw;
-    }
-  };
-
-  const previewObject = useMemo(() =>
-    rules.reduce((acc, rule, index) => {
-      const path = rule.target || `field_${index + 1}`;
-      let value;
-      if (rule.kind === "CONST") {
-        value = rule.source || "";
-      } else {
-        const raw = getNestedValue(sourceData, rule.source);
-        value = raw === undefined ? null : applyPreviewTransform(raw, rule.kind, rule.params);
-      }
-      setNestedValue(acc, path, value);
-      return acc;
-    }, {}),
-  [rules, sourceData]);
+  const previewObject = useMemo(() => buildTransformPreview(rules, sourceData), [rules, sourceData]);
 
   const previewJson = useMemo(() => JSON.stringify(previewObject, null, 2), [previewObject]);
 
@@ -391,7 +441,15 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
   // Rules whose source_path doesn't resolve against the current Source JSON -- these
   // preview as null even though the real payload may well have a value at save/run time.
   const unresolvedRules = useMemo(
-    () => rules.filter((r) => r.kind !== "CONST" && r.source && getNestedValue(sourceData, r.source) === undefined),
+    () => rules.filter((r) => {
+      if (r.kind === "CONST" || !r.source) return false;
+      let scope = sourceData;
+      if (isArrayRule(r)) {
+        scope = getNestedValue(sourceData, r.arraySource);
+        if (r.arrayKind === "repeating") scope = Array.isArray(scope) ? scope[0] : undefined;
+      }
+      return getNestedValue(scope, r.source) === undefined;
+    }),
     [rules, sourceData],
   );
 
@@ -417,6 +475,8 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
     if (!activeClientId) { setSaveError("Select a client first."); return; }
     if (!selectedTargetId && !showNewTarget) { setSaveError("Select or create a target system."); return; }
     if (showNewTarget && !newTargetBaseUrl.trim()) { setSaveError("Target base URL is required."); return; }
+    const incompleteArrayRule = rules.find((r) => r.arrayKind && r.arrayKind !== "none" && (!(r.arraySource || "").trim() || !(r.arrayTarget || "").trim()));
+    if (incompleteArrayRule) { setSaveError(`Array mapping for "${incompleteArrayRule.target || incompleteArrayRule.source}" needs both an array source path and an array target path.`); return; }
 
     setSaving(true); setSaveError(null); setSavedOk(false);
     try {
@@ -483,20 +543,7 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
 
         await Promise.all(
           rules.map(async (rule, i) => {
-            const payload = {
-              // "CONST" is UI-only -- the engine reads a literal value from
-              // source_path prefixed with "__literal." (see transform.py),
-              // not from transform_type.
-              source_path: rule.kind === "CONST" ? `${LITERAL_PREFIX}${rule.source || ""}` : (rule.source || ""),
-              target_path: rule.target || "",
-              transform_type: rule.kind === "CONST" ? "none" : rule.kind,
-              transform_params: TYPES_WITH_PARAMS.has(rule.kind) && rule.params ? rule.params : null,
-              sort_order: i,
-              is_required: false,
-              array_source_path: "",
-              array_target_path: "",
-              is_singleton_array: false,
-            };
+            const payload = ruleToMappingEntry(rule, i);
 
             if (rule.mapping_pk) {
               const updated = await updateFieldMapping(rule.mapping_pk, payload);
@@ -1030,7 +1077,7 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
                       </span>
                       <span className="min-w-0 flex-1 truncate text-xs text-slate-500">{rule.source || "—"}</span>
                       <span className="material-symbols-outlined shrink-0 text-sm text-slate-400">arrow_forward</span>
-                      <span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-700">{rule.target || "—"}</span>
+                      <span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-700">{isArrayRule(rule) ? `${rule.arrayTarget.trim()}${rule.arrayKind === "singleton_object" ? "." : "[]."}` : ""}{rule.target || "—"}</span>
                       {/* "i" tooltip — onMouseEnter/Leave feeds the fixed portal tooltip */}
                       <button type="button" aria-label="Rule details"
                         className="shrink-0 flex h-5 w-5 cursor-default items-center justify-center rounded-full bg-slate-200 text-[10px] font-bold text-slate-500 transition hover:bg-primary/10 hover:text-primary"
@@ -1074,6 +1121,41 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
                             <input value={rule.target} onChange={(e) => handleRuleChange(index, "target", e.target.value)}
                               placeholder="Target field"
                               className="mt-1 w-full rounded-2xl border border-outline bg-white px-2.5 py-2 text-xs text-slate-900 outline-none focus:border-primary focus:ring-2 focus:ring-primary/10" />
+                          </div>
+                          <div className="rounded-2xl border border-outline-variant bg-white p-2.5">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[10px] font-semibold uppercase text-slate-500">Array mapping</span>
+                              <button type="button" role="switch" aria-label="Array mapping" aria-checked={rule.arrayKind !== "none" && !!rule.arrayKind}
+                                onClick={() => handleRuleChange(index, "arrayKind", rule.arrayKind && rule.arrayKind !== "none" ? "none" : "repeating")}
+                                className={`relative inline-flex h-5 w-9 flex-shrink-0 rounded-full border-2 border-transparent transition-colors duration-200 focus:outline-none ${rule.arrayKind && rule.arrayKind !== "none" ? "bg-primary" : "bg-slate-200"}`}>
+                                <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ${rule.arrayKind && rule.arrayKind !== "none" ? "translate-x-4" : "translate-x-0"}`} />
+                              </button>
+                            </div>
+                            {rule.arrayKind && rule.arrayKind !== "none" && (
+                              <div className="mt-2 space-y-2">
+                                <select value={rule.arrayKind} onChange={(e) => handleRuleChange(index, "arrayKind", e.target.value)}
+                                  className="w-full rounded-2xl border border-outline-variant bg-white px-2.5 py-1.5 text-xs text-slate-700 outline-none focus:border-primary focus:ring-2 focus:ring-primary/10">
+                                  {ARRAY_KINDS.filter((k) => k.value !== "none").map((k) => <option key={k.value} value={k.value}>{k.label}</option>)}
+                                </select>
+                                <div>
+                                  <label className="block text-[10px] font-semibold uppercase text-slate-500">Array source path</label>
+                                  <input value={rule.arraySource || ""} onChange={(e) => handleRuleChange(index, "arraySource", e.target.value)}
+                                    placeholder="e.g. contractLines"
+                                    className="mt-1 w-full rounded-2xl border border-outline bg-white px-2.5 py-2 text-xs text-slate-900 outline-none focus:border-primary focus:ring-2 focus:ring-primary/10" />
+                                </div>
+                                <div>
+                                  <label className="block text-[10px] font-semibold uppercase text-slate-500">Array target path</label>
+                                  <input value={rule.arrayTarget || ""} onChange={(e) => handleRuleChange(index, "arrayTarget", e.target.value)}
+                                    placeholder="e.g. LineItems"
+                                    className="mt-1 w-full rounded-2xl border border-outline bg-white px-2.5 py-2 text-xs text-slate-900 outline-none focus:border-primary focus:ring-2 focus:ring-primary/10" />
+                                </div>
+                                <p className="text-[10px] text-slate-500">
+                                  {rule.arrayKind === "repeating"
+                                    ? "Source path above is relative to each item of the array source."
+                                    : "Source path above is relative to the array source object."}
+                                </p>
+                              </div>
+                            )}
                           </div>
                           {TYPES_WITH_PARAMS.has(rule.kind) && (
                             <div>
