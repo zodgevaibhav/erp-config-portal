@@ -193,29 +193,48 @@ const buildTransformPreview = (rules, sourceData) => {
   const buildFields = (entries, scope) =>
     entries.reduce((acc, { rule, target }) => { acc[target] = resolve(rule, scope); return acc; }, {});
 
-  for (const entries of grouped.values()) {
-    const { arraySource, arrayTarget, arrayKind } = entries[0].rule;
-    const targetKey = arrayTarget.trim();
-    if (targetKey.includes(".")) continue; // nested group: built inside its parent below
+  // A dotted array target is a child array when a repeating group's target is its prefix
+  // ("Line.Attrs" under "Line"); otherwise it's a nested object path ("lines.LineItems" ->
+  // { lines: { LineItems: [...] } }). Shallower targets are classified first. Mirrors transform_payload().
+  const targetOf = (entries) => entries[0].rule.arrayTarget.trim();
+  const rootGroups = [];
+  const repeatingRoots = [];
+  [...grouped.values()]
+    .map((entries, order) => ({ entries, order }))
+    .sort((x, y) => targetOf(x.entries).split(".").length - targetOf(y.entries).split(".").length)
+    .forEach(({ entries, order }) => {
+      const target = targetOf(entries);
+      if (repeatingRoots.some((root) => target.startsWith(`${root}.`))) return;
+      rootGroups.push({ entries, order });
+      if (entries[0].rule.arrayKind === "repeating") repeatingRoots.push(target);
+    });
+  rootGroups.sort((x, y) => x.order - y.order);
+
+  for (const { entries } of rootGroups) {
+    const { arraySource, arrayKind } = entries[0].rule;
+    const targetKey = targetOf(entries);
+    let value;
     if (arrayKind !== "repeating") {
       const built = buildFields(entries, getNestedValue(sourceData, arraySource));
-      result[targetKey] = arrayKind === "singleton_object" ? built : [built];
-      continue;
+      value = arrayKind === "singleton_object" ? built : [built];
+    } else {
+      const items = getNestedValue(sourceData, arraySource);
+      value = Array.isArray(items)
+        ? items.map((item) => {
+            const builtItem = buildFields(entries, item);
+            for (const nestedEntries of grouped.values()) {
+              const nestedTarget = targetOf(nestedEntries);
+              if (!nestedTarget.startsWith(`${targetKey}.`)) continue;
+              const childKey = (nestedEntries[0].rule.arraySource || "").split("[].").slice(1).join("[].");
+              const childScope = item && typeof item === "object" ? getNestedValue(item, childKey) : undefined;
+              builtItem[nestedTarget.split(".").pop()] = [buildFields(nestedEntries, childScope)];
+            }
+            return builtItem;
+          })
+        : [];
     }
-    const items = getNestedValue(sourceData, arraySource);
-    result[targetKey] = Array.isArray(items)
-      ? items.map((item) => {
-          const builtItem = buildFields(entries, item);
-          for (const [nestedKey, nestedEntries] of grouped) {
-            const nestedTarget = nestedKey.split("\u0000")[1];
-            if (!nestedTarget.startsWith(`${targetKey}.`)) continue;
-            const childKey = (nestedEntries[0].rule.arraySource || "").split("[].").slice(1).join("[].");
-            const childScope = item && typeof item === "object" ? getNestedValue(item, childKey) : undefined;
-            builtItem[nestedTarget.split(".").pop()] = [buildFields(nestedEntries, childScope)];
-          }
-          return builtItem;
-        })
-      : [];
+    if (targetKey.includes(".")) setNestedValue(result, targetKey, value);
+    else result[targetKey] = value;
   }
   return result;
 };
@@ -1146,12 +1165,12 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
                                 <div>
                                   <label className="block text-[10px] font-semibold uppercase text-slate-500">Array target path</label>
                                   <input value={rule.arrayTarget || ""} onChange={(e) => handleRuleChange(index, "arrayTarget", e.target.value)}
-                                    placeholder="e.g. LineItems"
+                                    placeholder="e.g. LineItems or lines.LineItems"
                                     className="mt-1 w-full rounded-2xl border border-outline bg-white px-2.5 py-2 text-xs text-slate-900 outline-none focus:border-primary focus:ring-2 focus:ring-primary/10" />
                                 </div>
                                 <p className="text-[10px] text-slate-500">
                                   {rule.arrayKind === "repeating"
-                                    ? "Source path above is relative to each item of the array source."
+                                    ? "Source path above is relative to each item of the array source. A dotted target (lines.LineItems) writes the array under a nested object."
                                     : "Source path above is relative to the array source object."}
                                 </p>
                               </div>
