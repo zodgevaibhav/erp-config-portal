@@ -68,10 +68,22 @@ const getParamsPlaceholder = (kind) => {
 };
 // Splits a dotted/bracket path (e.g. "ContractLine[0].StartDate") into ordered
 // {key} / {index} steps so both array indices and object keys can be walked.
+// Splits a mapping path on dots; "\\." is a literal dot inside one key name ("user\\.name" -> ["user.name"]).
+// Same rule as _split_path() in transformation-svc -- the source payload itself is never escaped.
+const splitPath = (path) => {
+  const segments = [""];
+  const text = path || "";
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === "\\" && text[i + 1] === ".") { segments[segments.length - 1] += "."; i += 1; }
+    else if (text[i] === ".") segments.push("");
+    else segments[segments.length - 1] += text[i];
+  }
+  return segments;
+};
 const parsePathSegments = (path) => {
   if (!path) return [];
   const segments = [];
-  for (const part of path.trim().split(".").filter(Boolean)) {
+  for (const part of splitPath(path.trim()).filter(Boolean)) {
     const match = part.match(/^([^[]+)((?:\[\d+\])*)$/);
     if (!match) { segments.push({ key: part }); continue; }
     const [, key, indices] = match;
@@ -191,20 +203,22 @@ const buildTransformPreview = (rules, sourceData) => {
     grouped.get(key).push({ rule, target });
   });
   const buildFields = (entries, scope) =>
-    entries.reduce((acc, { rule, target }) => { acc[target] = resolve(rule, scope); return acc; }, {});
+    entries.reduce((acc, { rule, target }) => { setNestedValue(acc, target, resolve(rule, scope)); return acc; }, {});
 
   // A dotted array target is a child array when a repeating group's target is its prefix
   // ("Line.Attrs" under "Line"); otherwise it's a nested object path ("lines.LineItems" ->
   // { lines: { LineItems: [...] } }). Shallower targets are classified first. Mirrors transform_payload().
   const targetOf = (entries) => entries[0].rule.arrayTarget.trim();
+  const segmentsOf = (entries) => splitPath(targetOf(entries));
+  const isBelow = (target, root) => target.length > root.length && root.every((seg, i) => target[i] === seg);
   const rootGroups = [];
   const repeatingRoots = [];
   [...grouped.values()]
     .map((entries, order) => ({ entries, order }))
-    .sort((x, y) => targetOf(x.entries).split(".").length - targetOf(y.entries).split(".").length)
+    .sort((x, y) => segmentsOf(x.entries).length - segmentsOf(y.entries).length)
     .forEach(({ entries, order }) => {
-      const target = targetOf(entries);
-      if (repeatingRoots.some((root) => target.startsWith(`${root}.`))) return;
+      const target = segmentsOf(entries);
+      if (repeatingRoots.some((root) => isBelow(target, root))) return;
       rootGroups.push({ entries, order });
       if (entries[0].rule.arrayKind === "repeating") repeatingRoots.push(target);
     });
@@ -212,7 +226,7 @@ const buildTransformPreview = (rules, sourceData) => {
 
   for (const { entries } of rootGroups) {
     const { arraySource, arrayKind } = entries[0].rule;
-    const targetKey = targetOf(entries);
+    const targetSegments = segmentsOf(entries);
     let value;
     if (arrayKind !== "repeating") {
       const built = buildFields(entries, getNestedValue(sourceData, arraySource));
@@ -223,18 +237,18 @@ const buildTransformPreview = (rules, sourceData) => {
         ? items.map((item) => {
             const builtItem = buildFields(entries, item);
             for (const nestedEntries of grouped.values()) {
-              const nestedTarget = targetOf(nestedEntries);
-              if (!nestedTarget.startsWith(`${targetKey}.`)) continue;
+              const nestedSegments = segmentsOf(nestedEntries);
+              if (!isBelow(nestedSegments, targetSegments)) continue;
               const childKey = (nestedEntries[0].rule.arraySource || "").split("[].").slice(1).join("[].");
               const childScope = item && typeof item === "object" ? getNestedValue(item, childKey) : undefined;
-              builtItem[nestedTarget.split(".").pop()] = [buildFields(nestedEntries, childScope)];
+              builtItem[nestedSegments[nestedSegments.length - 1]] = [buildFields(nestedEntries, childScope)];
             }
             return builtItem;
           })
         : [];
     }
-    if (targetKey.includes(".")) setNestedValue(result, targetKey, value);
-    else result[targetKey] = value;
+    if (targetSegments.length > 1) setNestedValue(result, targetOf(entries), value);
+    else result[targetSegments[0]] = value;
   }
   return result;
 };
@@ -1137,6 +1151,7 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
                           </div>
                           <div>
                             <label className="block text-[10px] font-semibold uppercase text-slate-500">Target field</label>
+                            <p className="text-[10px] text-slate-400">Use a.b for nested objects; write \. for a literal dot in a key name.</p>
                             <input value={rule.target} onChange={(e) => handleRuleChange(index, "target", e.target.value)}
                               placeholder="Target field"
                               className="mt-1 w-full rounded-2xl border border-outline bg-white px-2.5 py-2 text-xs text-slate-900 outline-none focus:border-primary focus:ring-2 focus:ring-primary/10" />
