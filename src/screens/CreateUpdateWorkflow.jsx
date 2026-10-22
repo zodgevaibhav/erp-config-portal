@@ -3,6 +3,8 @@ import { useClient } from "../common/ClientContext.jsx";
 import { getStep, createStep, updateStep } from "../common/api/steps.js";
 import { listTargets, createTarget } from "../common/api/targets.js";
 import { listFieldMappings, createFieldMapping, deleteFieldMapping, updateFieldMapping } from "../common/api/fieldMappings.js";
+import ConditionalRuleEditor from "../components/ConditionalRuleEditor.jsx";
+import { evaluateConditional, validateParams as validateConditionalParams } from "../common/conditionalRules.js";
 
 // ── constants ─────────────────────────────────────────────────────────────────
 const STEP_TYPE = { GET_STORE: "GET_STORE", TRANSFORM_POST: "TRANSFORM_POST" };
@@ -15,13 +17,13 @@ const STEP_TYPE = { GET_STORE: "GET_STORE", TRANSFORM_POST: "TRANSFORM_POST" };
 // which is how the engine actually resolves literal values.
 const TRANSFORM_TYPES = [
   "none", "type_cast", "date_format", "date_add", "split_pick",
-  "replace", "trim", "round", "uppercase", "lowercase", "titlecase",
+  "replace", "trim", "round", "uppercase", "lowercase", "titlecase", "conditional",
 ];
 const UI_RULE_KINDS = ["CONST", ...TRANSFORM_TYPES];
 const LITERAL_PREFIX = "__literal.";
 
 // transform_type values that need a transform_params JSON object.
-const TYPES_WITH_PARAMS = new Set(["type_cast", "date_format", "date_add", "split_pick", "replace", "round"]);
+const TYPES_WITH_PARAMS = new Set(["type_cast", "date_format", "date_add", "split_pick", "replace", "round", "conditional"]);
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 function toKVArray(obj) {
@@ -52,6 +54,7 @@ const getRuleHelpText = (kind) => {
     case "uppercase": return "Convert to UPPER CASE.";
     case "lowercase": return "Convert to lower case.";
     case "titlecase": return "Convert To Title Case.";
+    case "conditional": return "If / else rules over one or more source fields; the first matching rule wins.";
     default: return "";
   }
 };
@@ -121,7 +124,12 @@ const setNestedValue = (root, path, value) => {
 };
 // Best-effort JS mirror of apply_field_transform() (transformation-svc/erp_transform/transform.py)
 // for live preview only -- the actual transform always runs server-side.
-const applyPreviewTransform = (raw, kind, paramsStr) => {
+const applyPreviewTransform = (raw, kind, paramsStr, ctx) => {
+  if (kind === "conditional") {
+    // Conditions may test other fields, so this runs even when the rule's own source is missing.
+    const res = evaluateConditional(paramsStr, raw ?? undefined, ctx?.scope, ctx?.root, getNestedValue);
+    return res.error ? null : res.value;
+  }
   if (raw === undefined || raw === null) return raw;
   let params = {};
   try { params = paramsStr ? JSON.parse(paramsStr) : {}; } catch { /* ignore invalid params in preview */ }
@@ -215,6 +223,7 @@ const buildTransformPreview = (rules, sourceData, warnings = []) => {
   const resolve = (rule, scope) => {
     if (rule.kind === "CONST") return rule.source || "";
     const raw = getNestedValue(scope, rule.source);
+    if (rule.kind === "conditional") return applyPreviewTransform(raw, rule.kind, rule.params, { scope, root: sourceData });
     return raw === undefined ? null : applyPreviewTransform(raw, rule.kind, rule.params);
   };
   const result = {};
@@ -493,7 +502,9 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
         const raw = rule.kind === "CONST" ? rule.source || "" : resolveIterationSource(rule.source, item);
         let value = raw;
         if (rule.kind !== "CONST") {
-          value = raw === undefined ? null : applyPreviewTransform(raw, rule.kind, rule.params);
+          value = rule.kind === "conditional"
+            ? applyPreviewTransform(raw, rule.kind, rule.params, { scope: item, root: ITERATION_SAMPLE_ROOT })
+            : (raw === undefined ? null : applyPreviewTransform(raw, rule.kind, rule.params));
         }
         setNestedValue(acc, path, value);
         return acc;
@@ -509,7 +520,7 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
   // preview as null even though the real payload may well have a value at save/run time.
   const unresolvedRules = useMemo(
     () => rules.filter((r) => {
-      if (r.kind === "CONST" || !r.source) return false;
+      if (r.kind === "CONST" || r.kind === "conditional" || !r.source) return false;
       let scope = sourceData;
       if (isArrayRule(r)) {
         scope = getNestedValue(sourceData, r.arraySource);
@@ -544,6 +555,12 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
     if (showNewTarget && !newTargetBaseUrl.trim()) { setSaveError("Target base URL is required."); return; }
     const incompleteArrayRule = rules.find((r) => r.arrayKind && r.arrayKind !== "none" && (!(r.arraySource || "").trim() || !(r.arrayTarget || "").trim()));
     if (incompleteArrayRule) { setSaveError(`Array mapping for "${incompleteArrayRule.target || incompleteArrayRule.source}" needs both an array source path and an array target path.`); return; }
+
+    for (const r of rules) {
+      if (r.kind !== "conditional") continue;
+      const problems = validateConditionalParams(r.params);
+      if (problems.length) { setSaveError(`Conditional rule for "${r.target || r.source || "(unnamed)"}": ${problems[0]}`); return; }
+    }
 
     setSaving(true); setSaveError(null); setSavedOk(false);
     try {
@@ -1178,7 +1195,7 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
                         <div className="space-y-2">
                           <div>
                             <label className="block text-[10px] font-semibold uppercase text-slate-500">
-                              {rule.kind === "CONST" ? "Constant Value" : "Source path"}
+                              {rule.kind === "CONST" ? "Constant Value" : (rule.kind === "conditional" ? "Source path (optional)" : "Source path")}
                             </label>
                             <input value={rule.source} onChange={(e) => handleRuleChange(index, "source", e.target.value)}
                               placeholder={rule.kind === "CONST" ? "e.g. active" : "e.g. contract.name"}
@@ -1226,7 +1243,23 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
                               </div>
                             )}
                           </div>
-                          {TYPES_WITH_PARAMS.has(rule.kind) && (
+                          {rule.kind === "conditional" && (
+                            <ConditionalRuleEditor
+                              value={rule.params}
+                              onChange={(next) => handleRuleChange(index, "params", next)}
+                              sampleSource={sourceData}
+                              evaluate={(text, own, scope, root) => evaluateConditional(text, own, scope, root, getNestedValue, null)}
+                              getSample={() => {
+                                let scope = sourceData;
+                                if (isArrayRule(rule)) {
+                                  scope = getNestedValue(sourceData, rule.arraySource);
+                                  if (rule.arrayKind === "repeating") scope = Array.isArray(scope) ? scope[0] : undefined;
+                                }
+                                return { own: rule.source ? getNestedValue(scope, rule.source) : undefined, scope, root: sourceData };
+                              }}
+                            />
+                          )}
+                          {TYPES_WITH_PARAMS.has(rule.kind) && rule.kind !== "conditional" && (
                             <div>
                               <label className="block text-[10px] font-semibold uppercase text-slate-500">Params (JSON)</label>
                               <input value={rule.params} onChange={(e) => handleRuleChange(index, "params", e.target.value)}
