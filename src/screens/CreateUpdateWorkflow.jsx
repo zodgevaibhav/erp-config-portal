@@ -382,6 +382,12 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
         setArrayJsonPath(iterationConfig.array_json_path || "$.contracts[*]");
         setItemAlias(iterationConfig.item_alias || "item");
         setRootAlias(iterationConfig.root_alias || "root");
+        if (stepData.source_json != null) {
+          const savedSource = JSON.stringify(stepData.source_json, null, 2);
+          setSourceJson(savedSource);
+          setSourceData(stepData.source_json);
+          setJsonError("");
+        }
         setSelectedTargetId(stepData.target_id ?? "");
         setQueryParams(toKVArray(stepData.query_params));
         setRequestHeaders(toKVArray(stepData.headers));
@@ -600,6 +606,8 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
         query_params: Object.keys(qpObj).length ? qpObj : null,
         headers: Object.keys(hdrsObj).length ? hdrsObj : null,
         extract: Object.keys(extObj).length ? extObj : null,
+        // Last valid Source JSON, so the mappings can be validated against it on reopen.
+        source_json: sourceData,
         ...(stepType === STEP_TYPE.TRANSFORM_POST && {
           iteration_config: executionMode === "forEach"
             ? {
