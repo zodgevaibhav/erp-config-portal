@@ -219,7 +219,9 @@ const isBelow = (target, root) => target.length > root.length && root.every((seg
 // its array source ("contracts" -> "contracts.contractLines") from that item. Any other dotted target is
 // a nested object path. "default_value" and extracted values aren't modelled here. Problems are pushed
 // onto `warnings` (the engine raises instead).
-const buildTransformPreview = (rules, sourceData, warnings = []) => {
+// omitMissingArrays mirrors the step flag in transformation-svc: an array whose source node is
+// absent (missing, null or not a list) is left out instead of becoming []; a real [] still gives [].
+const buildTransformPreview = (rules, sourceData, warnings = [], omitMissingArrays = false) => {
   const resolve = (rule, scope) => {
     if (rule.kind === "CONST") return rule.source || "";
     const raw = getNestedValue(scope, rule.source);
@@ -268,6 +270,7 @@ const buildTransformPreview = (rules, sourceData, warnings = []) => {
     if (child.arraySource.includes("[].")) {
       const childKey = child.arraySource.split("[].").slice(1).join("[].");
       const scope = parentScope && typeof parentScope === "object" ? getNestedValue(parentScope, childKey) : undefined;
+      if (omitMissingArrays && scope == null) return;
       builtParent[child.targetSegs[child.targetSegs.length - 1]] = [buildFields(child.entries, scope)];
       return;
     }
@@ -277,6 +280,7 @@ const buildTransformPreview = (rules, sourceData, warnings = []) => {
       return;
     }
     const node = getSegments(parentScope, child.sourceSegs.slice(parent.sourceSegs.length));
+    if (omitMissingArrays && (child.kind === "repeating" ? !Array.isArray(node) : node == null)) return;
     const value = child.kind === "repeating"
       ? (Array.isArray(node) ? node.map((element) => buildItem(child, element)) : [])
       : wrap(child, buildItem(child, node));
@@ -285,6 +289,7 @@ const buildTransformPreview = (rules, sourceData, warnings = []) => {
 
   roots.forEach((group) => {
     const node = getSegments(sourceData, group.sourceSegs);
+    if (omitMissingArrays && (group.kind === "repeating" ? !Array.isArray(node) : node == null)) return;
     const value = group.kind === "repeating"
       ? (Array.isArray(node) ? node.map((element) => buildItem(group, element)) : [])
       : wrap(group, buildItem(group, node));
@@ -315,6 +320,7 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
   const [method, setMethod] = useState("POST");
   const [stepPath, setStepPath] = useState("/");
   const [executionMode, setExecutionMode] = useState("single");
+  const [omitMissingArrays, setOmitMissingArrays] = useState(false);
   const [iterationConfigCollapsed, setIterationConfigCollapsed] = useState(false);
   const [arrayJsonPath, setArrayJsonPath] = useState("$.contracts[*]");
   const [itemAlias, setItemAlias] = useState("item");
@@ -379,6 +385,7 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
         setStepPath(stepData.path ?? "/");
         const iterationConfig = stepData.iteration_config ?? { mode: "single" };
         setExecutionMode(iterationConfig.mode === "for_each_array_item" ? "forEach" : "single");
+        setOmitMissingArrays(stepData.omit_missing_arrays === true);
         setArrayJsonPath(iterationConfig.array_json_path || "$.contracts[*]");
         setItemAlias(iterationConfig.item_alias || "item");
         setRootAlias(iterationConfig.root_alias || "root");
@@ -479,8 +486,8 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
 
   const { previewObject, previewWarnings } = useMemo(() => {
     const warnings = [];
-    return { previewObject: buildTransformPreview(rules, sourceData, warnings), previewWarnings: warnings };
-  }, [rules, sourceData]);
+    return { previewObject: buildTransformPreview(rules, sourceData, warnings, omitMissingArrays), previewWarnings: warnings };
+  }, [rules, sourceData, omitMissingArrays]);
 
   const previewJson = useMemo(() => JSON.stringify(previewObject, null, 2), [previewObject]);
 
@@ -609,6 +616,7 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
         // Last valid Source JSON, so the mappings can be validated against it on reopen.
         source_json: sourceData,
         ...(stepType === STEP_TYPE.TRANSFORM_POST && {
+          omit_missing_arrays: omitMissingArrays,
           iteration_config: executionMode === "forEach"
             ? {
                 mode: "for_each_array_item",
@@ -745,6 +753,11 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
                 </button>
               ))}
             </fieldset>
+            <label className="ml-2 flex items-center gap-1.5 text-xs font-semibold text-slate-600"
+              title="When on, an array mapping whose source node is absent is left out of the request body instead of being sent as []. A source array that is really empty still sends [].">
+              <input type="checkbox" checked={omitMissingArrays} onChange={(e) => setOmitMissingArrays(e.target.checked)} />
+              Omit arrays missing from source
+            </label>
           </div>
         )}
       </div>
