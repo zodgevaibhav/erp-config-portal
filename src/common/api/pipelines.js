@@ -9,3 +9,5 @@ export const createPipeline = (data) => request({ url: '/pipelines', method: 'PO
 export const updatePipeline = (id, data) => request({ url: `/pipelines/${id}`, method: 'PATCH', body: data });
 export const deletePipeline = (id) => request({ url: `/pipelines/${id}`, method: 'DELETE' });
 export const getPipelineSteps = (id) => request({ url: `/pipelines/${id}/steps`, list: true });
+export const dryRunPipeline = (id, source) =>
+  request({ url: `/pipelines/${encodeURIComponent(id)}/dry-run`, method: 'POST', body: { source } });
