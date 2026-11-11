@@ -123,6 +123,11 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
   const [stepName, setStepName] = useState("");
   const [method, setMethod] = useState("POST");
   const [stepPath, setStepPath] = useState("/");
+  // Output pruning (transformation-svc): on by default -- empty arrays [], empty objects {} and
+  // nulls are left out of the request sent to the target API.
+  const [omitEmptyArrays, setOmitEmptyArrays] = useState(true);
+  const [omitEmptyObjects, setOmitEmptyObjects] = useState(true);
+  const [omitNulls, setOmitNulls] = useState(true);
 
   // Target system
   const [targets, setTargets] = useState([]);
@@ -179,6 +184,10 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
         setStepName(stepData.step_name);
         setMethod(stepData.method);
         setStepPath(stepData.path ?? "/");
+        // field missing from the API response (older backend/rows) => default on
+        setOmitEmptyArrays(stepData.omit_empty_arrays !== false);
+        setOmitEmptyObjects(stepData.omit_empty_objects !== false);
+        setOmitNulls(stepData.omit_nulls !== false);
         setSelectedTargetId(stepData.target_id ?? "");
         setQueryParams(toKVArray(stepData.query_params));
         setRequestHeaders(toKVArray(stepData.headers));
@@ -402,6 +411,9 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
         query_params: Object.keys(qpObj).length ? qpObj : null,
         headers: Object.keys(hdrsObj).length ? hdrsObj : null,
         extract: Object.keys(extObj).length ? extObj : null,
+        omit_empty_arrays: omitEmptyArrays,
+        omit_empty_objects: omitEmptyObjects,
+        omit_nulls: omitNulls,
       };
 
       const savedStep = stepPk
@@ -527,6 +539,23 @@ function CreateUpdateWorkflow({ stepPk, onBack }) {
           className="mt-1 w-full border-0 bg-transparent text-lg font-semibold text-slate-900 outline-none placeholder:text-slate-300"
           placeholder="Enter step name…"
         />
+        {!isGetStore && (
+          <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1">
+            {[
+              { label: "Omit empty arrays", checked: omitEmptyArrays, set: setOmitEmptyArrays,
+                hint: "Leave empty arrays [] out of the request sent to the target API." },
+              { label: "Omit empty objects", checked: omitEmptyObjects, set: setOmitEmptyObjects,
+                hint: "Leave empty objects {} (including objects left empty after pruning) out of the request sent to the target API." },
+              { label: "Omit null values", checked: omitNulls, set: setOmitNulls,
+                hint: "Leave fields whose value is null out of the request sent to the target API." },
+            ].map(({ label, checked, set, hint }) => (
+              <label key={label} title={hint} className="flex items-center gap-1.5 text-xs font-semibold text-slate-600">
+                <input type="checkbox" checked={checked} onChange={(e) => set(e.target.checked)} />
+                {label}
+              </label>
+            ))}
+          </div>
+        )}
       </div>
       <div className="flex shrink-0 items-center gap-2">
         {saveError && <span className="max-w-xs truncate text-xs text-red-600">{saveError}</span>}
