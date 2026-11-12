@@ -145,11 +145,13 @@ function ManageClients() {
                     className="rounded-2xl border border-outline-variant bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-surface-container-high">
                     Edit
                   </button>
-                  <button
+                  {/* Delete is disabled until user/access management exists (the API refuses it with 403 unless
+                      ERP_CONFIG_DELETE_ENABLED=true). Re-enable together with the server switch. */}
+                  {/* <button
                     onClick={() => handleDelete(c)}
                     className="rounded-2xl border border-red-200 bg-white px-3 py-1.5 text-xs font-semibold text-red-600 transition hover:bg-red-50">
                     Delete
-                  </button>
+                  </button> */}
                 </div>
               </div>
             </div>
