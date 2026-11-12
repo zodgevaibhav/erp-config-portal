@@ -77,43 +77,13 @@ function StepDetail({ step, onClose }) {
 
   if (!step) return null;
 
-  const getHeaderMap = (kind) => {
-    const candidates = [
-      step?.[`${kind}_headers`],
-      step?.[`${kind}Headers`],
-      step?.[kind]?.headers,
-      step?.headers?.[kind],
-      step?.http_headers?.[kind],
-      step?.http_headers?.[kind.toUpperCase()],
-      step?.request?.headers,
-      step?.response?.headers,
-    ];
+  // The API returns request_url, request_headers and response_headers on each
+  // step row (values already masked by the backend). Rows from before that
+  // change, and steps that never made a call, have none of them.
+  const generatedUrl = step.request_url || '—';
 
-    for (const candidate of candidates) {
-      if (candidate && typeof candidate === 'object' && Object.keys(candidate).length) {
-        return candidate;
-      }
-    }
-    return {};
-  };
-
-  const generatedUrl = (
-    step.request_url ||
-    step.generated_url ||
-    step.url ||
-    step.request?.url ||
-    step.response?.url ||
-    step.request_received?.url ||
-    step.transformed_request?.url ||
-    step.response_received?.url ||
-    step.request_received?.request_url ||
-    step.transformed_request?.request_url ||
-    step.response_received?.request_url ||
-    '—'
-  );
-
-  const requestHeaders = getHeaderMap('request');
-  const responseHeaders = getHeaderMap('response');
+  const requestHeaders = step.request_headers || {};
+  const responseHeaders = step.response_headers || {};
 
   const tabs = [
     { key: 'request', label: 'Request' },
@@ -190,7 +160,7 @@ function StepDetail({ step, onClose }) {
   const renderHeaders = (headerMap) => {
     const entries = Object.entries(headerMap || {});
     if (!entries.length) {
-      return <p className="text-sm text-slate-400">No headers recorded for this step.</p>;
+      return <p className="text-sm text-slate-400">No headers recorded for this step (none are stored for runs from before this was added, or when no request was made).</p>;
     }
 
     return (
